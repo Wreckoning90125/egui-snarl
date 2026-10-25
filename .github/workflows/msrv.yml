@@ -2,7 +2,7 @@ name: Test MSRV
 
 on:
   pull_request:
-    types: [opened, reopened, edited]
+    types: [opened, reopened, edited, synchronize]
   push:
     branches: [ "main" ]
     paths:
