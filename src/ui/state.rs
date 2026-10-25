@@ -616,7 +616,7 @@ impl SnarlWidget {
     /// Use same `Ui` instance that was used in [`SnarlWidget::show`].
     #[inline]
     pub fn update_selected_nodes(self, ui: &Ui, f: impl FnOnce(&mut Vec<NodeId>)) {
-        let snarl_id = self.get_id(ui.id());
+        let snarl_id = self.get_id(ui.scope_id());
         update_selected_nodes(snarl_id, ui.ctx(), f);
     }
 }

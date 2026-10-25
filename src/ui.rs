@@ -1297,8 +1297,8 @@ where
             };
 
             if viewer.has_dropped_wire_menu(pins, snarl) {
-                let popup_id = egui::Id::new("snarl_dropped_wire_popup").with(snarl_id);
-                let pos_id = egui::Id::new("snarl_dropped_wire_pos").with(snarl_id);
+                let popup_id = snarl_id.with("dropped_wire_popup");
+                let pos_id = snarl_id.with("dropped_wire_pos");
                 let force_open = snarl_resp.flags.contains(Flags::LONG_TOUCHED);
 
                 if force_open {
