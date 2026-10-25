@@ -352,4 +352,12 @@ pub trait SnarlViewer<T> {
     fn current_transform(&mut self, to_global: &mut TSTransform, snarl: &mut Snarl<T>) {
         let _ = (to_global, snarl);
     }
+
+    /// Close behavior for context menus (graph, node, dropped-wire).
+    /// Default is `CloseOnClick` (compatible with old behavior).
+    /// Override to `CloseOnClickOutside` if your menu has interactive widgets
+    /// (search fields, collapsible sections, sliders).
+    fn menu_close_behavior(&self) -> egui::PopupCloseBehavior {
+        egui::PopupCloseBehavior::CloseOnClick
+    }
 }
