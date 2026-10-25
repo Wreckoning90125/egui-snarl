@@ -18,8 +18,8 @@ syn = { version = "3" }
 serde = { version = "1" }
 serde_json = { version = "1" }
 
-egui-probe = { version = "0.14.0" }
-egui-scale = { version = "0.7.0" }
+egui-probe = { version = "0.14.0", git = "https://github.com/rafaga/egui-probe.git", rev = "577f81e223abe9d111f82cf89d7c55feca14fa5e" }
+egui-scale = { version = "0.7.0", git = "https://github.com/rafaga/egui-scale.git", rev = "07455a501306bffeb2361313d0f74c53f9fb7303" }
 wasm-bindgen-futures = "0.4"
 web-sys = "0.3.103"
 
