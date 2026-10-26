@@ -643,3 +643,58 @@ pub fn update_selected_nodes(id: Id, ctx: &Context, f: impl FnOnce(&mut Vec<Node
         selection.0 = SmallVec::from_vec(nodes);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use egui::{Context, Id};
+
+    use super::{get_selected_nodes, update_selected_nodes};
+    use crate::NodeId;
+
+    #[test]
+    fn update_selected_nodes_replaces_appends_and_clears() {
+        let ctx = Context::default();
+        let widget = Id::new("snarl-widget");
+
+        update_selected_nodes(widget, &ctx, |nodes| {
+            nodes.push(NodeId(1));
+        });
+        update_selected_nodes(widget, &ctx, |nodes| {
+            *nodes = vec![NodeId(4), NodeId(5)];
+        });
+        assert_eq!(get_selected_nodes(widget, &ctx), vec![NodeId(4), NodeId(5)]);
+
+        update_selected_nodes(widget, &ctx, |nodes| {
+            nodes.push(NodeId(6));
+        });
+        assert_eq!(
+            get_selected_nodes(widget, &ctx),
+            vec![NodeId(4), NodeId(5), NodeId(6)]
+        );
+
+        update_selected_nodes(widget, &ctx, |nodes| nodes.clear());
+        assert_eq!(get_selected_nodes(widget, &ctx), Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn second_widget_keeps_its_own_selection() {
+        let ctx = Context::default();
+        let first = Id::new("snarl-widget");
+        let second = Id::new("snarl-widget-other");
+
+        update_selected_nodes(first, &ctx, |nodes| {
+            *nodes = vec![NodeId(1), NodeId(2)];
+        });
+        update_selected_nodes(second, &ctx, |nodes| {
+            *nodes = vec![NodeId(8), NodeId(9)];
+        });
+
+        update_selected_nodes(first, &ctx, |nodes| {
+            nodes.push(NodeId(3));
+        });
+        update_selected_nodes(first, &ctx, |nodes| nodes.clear());
+
+        assert_eq!(get_selected_nodes(first, &ctx), Vec::<NodeId>::new());
+        assert_eq!(get_selected_nodes(second, &ctx), vec![NodeId(8), NodeId(9)]);
+    }
+}
