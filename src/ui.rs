@@ -1,11 +1,11 @@
 //! This module provides functionality for showing [`Snarl`] graph in [`Ui`].
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use egui::{
-    Align, Color32, CornerRadius, Frame, Id, IdSalt, LayerId, Layout, Margin, Modifiers,
-    PointerButton, Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder,
-    UiKind, UiStackInfo, Vec2,
+    Align, Color32, CornerRadius, Frame, Id, IdSalt, Key, Layout, Margin, Modifiers, PointerButton,
+    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind,
+    UiStackInfo, Vec2,
     collapsing_header::paint_default_icon,
     emath::{GuiRounding, TSTransform},
     epaint::Shadow,
@@ -18,7 +18,10 @@ use smallvec::SmallVec;
 
 use crate::{InPin, InPinId, Node, NodeId, OutPin, OutPinId, Snarl, ui::wire::WireId};
 
+mod anatomy;
 mod background_pattern;
+mod cable;
+mod nesting;
 mod pin;
 mod scale;
 mod state;
@@ -26,17 +29,22 @@ mod viewer;
 mod wire;
 
 use self::{
-    pin::AnyPin,
-    state::{NewWires, NodeState, RowHeights, SnarlState},
-    wire::{draw_wire, hit_wire, pick_wire_style},
+    nesting::ViewHost,
+    state::{NewWires, NodeState, RowHeights, SnarlState, has_keyboard, take_keyboard},
+    wire::{adjust_frame_size, cached_default_route, pick_wire_style},
 };
 
 pub use self::{
+    anatomy::{
+        InsertionAnchor, MeasuredNode, MeasuredPin, MeasuredWire, SnarlAnatomy, SnarlTransform,
+        SnarlViewIds, WireAction, WireTrigger, WireView, get_snarl_anatomy,
+    },
     background_pattern::{BackgroundPattern, Grid},
-    pin::{AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
-    state::{get_selected_nodes, update_selected_nodes},
+    cable::{CableAnchor, CableGeometry, CableHit, CableSway},
+    pin::{AnyPin, AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
+    state::{get_selected_nodes, get_selected_wire, set_selected_wire, update_selected_nodes},
     viewer::SnarlViewer,
-    wire::{WireLayer, WireStyle},
+    wire::{WireLayer, WirePaint, WirePins, WireRoute, WireStyle},
 };
 
 /// Controls how header, pins, body and footer are placed in the node.
@@ -558,6 +566,49 @@ pub struct SnarlStyle {
     )]
     pub wire_smoothness: Option<f32>,
 
+    /// How far the middle of a wire hangs below its taut path, as a share of the distance
+    /// between its pins. `0.0`, the default, keeps wires taut.
+    ///
+    /// The hanging wire is painted and hit tested along the same path.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(
+        feature = "egui-probe",
+        egui_probe(range = 0.0f32..=1.0f32 by 0.01f32)
+    )]
+    pub wire_slack: Option<f32>,
+
+    /// How much of a moving pin's motion the middle of its wires lags behind by, from `0.0` to `1.0`.
+    /// `0.0`, the default, keeps wires still.
+    ///
+    /// The lag is bounded, settles on its own, and only bends the path of the wire.
+    /// Wires stay still whatever this is set to while egui's `animation_time` is zero.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(
+        feature = "egui-probe",
+        egui_probe(range = 0.0f32..=1.0f32 by 0.01f32)
+    )]
+    pub wire_sway: Option<f32>,
+
+    /// Distance from a wire's path within which the pointer counts as on the wire, in screen points.
+    ///
+    /// It holds at every zoom level. By default the distance is `wire_width`, or 2 if that is
+    /// more, in graph units, so it shrinks on screen as the view zooms out.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(
+        feature = "egui-probe",
+        egui_probe(range = 0.0f32..=32.0f32 by 0.5f32)
+    )]
+    pub wire_hit_tolerance: Option<f32>,
+
     #[doc(hidden)]
     #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
     #[cfg_attr(feature = "serde", serde(skip_serializing, default))]
@@ -695,6 +746,30 @@ impl SnarlStyle {
     fn get_wire_smoothness(&self) -> f32 {
         self.wire_smoothness.unwrap_or(1.0)
     }
+
+    fn get_wire_slack(&self) -> f32 {
+        match self.wire_slack {
+            Some(slack) if slack.is_finite() => slack.clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    fn get_wire_sway(&self) -> f32 {
+        match self.wire_sway {
+            Some(sway) if sway.is_finite() => sway.clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Half-width of the band in which the pointer counts as on a wire, in graph units.
+    fn get_wire_hit_tolerance(&self, wire_width: f32, scale: f32) -> f32 {
+        match self.wire_hit_tolerance {
+            Some(tolerance) if tolerance.is_finite() && tolerance >= 0.0 && scale > 0.0 => {
+                tolerance / scale
+            }
+            _ => wire_width.max(2.0),
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -781,6 +856,9 @@ impl SnarlStyle {
             select_style: None,
             crisp_magnified_text: None,
             wire_smoothness: None,
+            wire_slack: None,
+            wire_sway: None,
+            wire_hit_tolerance: None,
 
             _non_exhaustive: (),
         }
@@ -800,6 +878,10 @@ struct DrawNodeResponse {
     drag_released: bool,
     pin_hovered: Option<AnyPin>,
     final_rect: Rect,
+    pos: Pos2,
+    open: bool,
+    openness: f32,
+    remeasured: bool,
 }
 
 struct DrawPinsResponse {
@@ -814,7 +896,18 @@ struct DrawBodyResponse {
 }
 
 struct PinResponse {
+    /// Centre of the pin, where its wires end.
     pos: Pos2,
+
+    /// Rectangle the pin is drawn in and reacts to the pointer in.
+    rect: Rect,
+
+    /// Rectangle the pin's row took up as laid out this pass.
+    row_rect: Rect,
+
+    /// Id the pin reacts to the pointer under.
+    widget_id: Id,
+
     wire_color: Color32,
     wire_style: WireStyle,
 }
@@ -924,6 +1017,51 @@ impl SnarlWidget {
     }
 }
 
+/// A connected wire after routing, before it is painted.
+struct LaidWire {
+    pins: WirePins,
+    geometry: Arc<CableGeometry>,
+    paint: WirePaint,
+    color: Color32,
+    tolerance: f32,
+}
+
+/// The wire a wire menu was opened for, and where on it.
+#[derive(Clone, Copy)]
+struct WireMenuTarget {
+    pins: WirePins,
+    insertion: InsertionAnchor,
+}
+
+/// Middle offsets of swaying wires and where their resting middles were last pass.
+#[derive(Clone, Default)]
+struct WireSways(Arc<HashMap<WirePins, (CableSway, Pos2)>>);
+
+fn default_wire_paint(
+    color: Color32,
+    width: f32,
+    hovered: bool,
+    selected: bool,
+    select_stroke: Stroke,
+) -> WirePaint {
+    let body = if hovered || selected {
+        width * 1.5
+    } else {
+        width
+    };
+
+    let paint = WirePaint::solid(Stroke::new(body, color)).with_hit_width(width);
+
+    if selected {
+        paint.under(Stroke::new(
+            select_stroke.width.max(1.0).mul_add(2.0, body),
+            select_stroke.color,
+        ))
+    } else {
+        paint
+    }
+}
+
 #[inline(never)]
 fn show_snarl<T, V>(
     snarl_id: Id,
@@ -939,7 +1077,7 @@ where
 {
     #![allow(clippy::too_many_lines)]
 
-    let (mut latest_pos, modifiers) = ui.ctx().input(|i| (i.pointer.latest_pos(), i.modifiers));
+    let (global_pointer, modifiers) = ui.ctx().input(|i| (i.pointer.latest_pos(), i.modifiers));
 
     let bg_frame = style.get_bg_frame(ui.style());
 
@@ -955,9 +1093,21 @@ where
     content_rect.max.x = content_rect.max.x.max(content_rect.min.x);
     content_rect.max.y = content_rect.max.y.max(content_rect.min.y);
 
-    let snarl_layer_id = LayerId::new(ui.layer_id().order, snarl_id);
+    let parent_layer = ui.layer_id();
+    let view_ids = SnarlViewIds::new(snarl_id, parent_layer.order);
+    let snarl_layer_id = view_ids.layer_id;
 
-    ui.ctx().set_sublayer(ui.layer_id(), snarl_layer_id);
+    // The layer this view is shown from may itself be the layer of another graph view.
+    let host = ViewHost::enter(ui.ctx(), snarl_id, parent_layer);
+    let parent_to_global = ui
+        .ctx()
+        .layer_transform_to_global(parent_layer)
+        .unwrap_or_default();
+
+    ui.ctx().set_sublayer(host.root_layer, snarl_layer_id);
+
+    // A view shown inside this one owns the pointer while the pointer is over it.
+    let pointer_in_embedded_view = host.pointer_in_embedded_view(global_pointer);
 
     let mut min_scale = style.get_min_scale();
     let mut max_scale = style.get_max_scale();
@@ -966,7 +1116,10 @@ where
 
     let mut snarl_state =
         SnarlState::load(ui.ctx(), snarl_id, snarl, ui_rect, min_scale, max_scale);
-    let mut to_global = snarl_state.to_global();
+
+    // The stored transform maps the graph into the coordinates of the `Ui` the view is shown in.
+    // That is the screen, unless the view is shown inside another transformed layer.
+    let mut to_parent = snarl_state.to_global();
 
     let clip_rect = ui.clip_rect();
 
@@ -986,28 +1139,39 @@ where
         max_scale = 1.0;
     }
 
-    clamp_scale(&mut to_global, min_scale, max_scale, ui_rect);
+    clamp_scale(&mut to_parent, min_scale, max_scale, ui_rect);
 
     let mut snarl_resp = ui.response();
-    Scene::new()
-        .zoom_range(min_scale..=max_scale)
-        .register_pan_and_zoom(&ui, &mut snarl_resp, &mut to_global);
 
-    if snarl_resp.changed() {
-        ui.ctx().request_repaint();
+    if !pointer_in_embedded_view || snarl_resp.dragged() {
+        // Pointer input arrives in screen coordinates, so pan and zoom the composed transform
+        // and take the parent's part back out.
+        let mut to_global = parent_to_global * to_parent;
+        let parent_scale = parent_to_global.scaling;
+
+        Scene::new()
+            .zoom_range(min_scale * parent_scale..=max_scale * parent_scale)
+            .register_pan_and_zoom(&ui, &mut snarl_resp, &mut to_global);
+
+        if snarl_resp.changed() {
+            to_parent = parent_to_global.inverse() * to_global;
+            ui.ctx().request_repaint();
+        }
     }
 
     // Inform viewer about current transform.
-    viewer.current_transform(&mut to_global, snarl);
+    viewer.current_transform(&mut to_parent, snarl);
 
-    snarl_state.set_to_global(to_global);
+    snarl_state.set_to_global(to_parent);
 
-    let to_global = to_global;
+    let to_parent = to_parent;
+    let from_parent = to_parent.inverse();
+    let to_global = parent_to_global * to_parent;
     let from_global = to_global.inverse();
 
     // Graph viewport
-    let viewport = (from_global * ui_rect).round_ui();
-    let viewport_clip = from_global * clip_rect;
+    let viewport = (from_parent * ui_rect).round_ui();
+    let viewport_clip = from_parent * clip_rect;
 
     ui.set_clip_rect(viewport.intersect(viewport_clip));
     ui.expand_to_include_rect(viewport);
@@ -1015,8 +1179,21 @@ where
     // Set transform for snarl layer.
     ui.ctx().set_transform_layer(snarl_layer_id, to_global);
 
+    let transform = SnarlTransform {
+        parent_to_global,
+        to_parent,
+        to_global,
+        from_global,
+        local_ui_rect: ui_rect,
+        global_ui_rect: parent_to_global * ui_rect,
+        global_clip_rect: parent_to_global * clip_rect.intersect(ui_rect),
+        viewport: ui.clip_rect(),
+    };
+
+    host.claim(ui.ctx(), transform.global_clip_rect);
+
     // Map latest pointer position to graph space.
-    latest_pos = latest_pos.map(|pos| from_global * pos);
+    let latest_pos = global_pointer.map(|pos| from_global * pos);
 
     viewer.draw_background(
         style.bg_pattern.as_ref(),
@@ -1056,8 +1233,9 @@ where
     let wire_frame_size = style.get_wire_frame_size(ui.style());
     let wire_width = style.get_wire_width(ui.style());
     let wire_threshold = style.get_wire_smoothness();
+    let wire_layer = style.get_wire_layer();
 
-    let wire_shape_idx = match style.get_wire_layer() {
+    let wire_shape_idx = match wire_layer {
         WireLayer::BehindNodes => Some(ui.painter().add(Shape::Noop)),
         WireLayer::AboveNodes => None,
     };
@@ -1071,7 +1249,7 @@ where
     let mut drag_released = false;
 
     let mut nodes_bb = Rect::NOTHING;
-    let mut node_rects = Vec::new();
+    let mut measured_nodes = Vec::with_capacity(draw_order.len());
 
     for node_idx in draw_order {
         if !snarl.nodes.contains(node_idx.0) {
@@ -1086,7 +1264,7 @@ where
             viewer,
             &mut snarl_state,
             &style,
-            snarl_id,
+            view_ids,
             &mut input_info,
             modifiers,
             &mut output_info,
@@ -1105,102 +1283,374 @@ where
             drag_released |= response.drag_released;
 
             nodes_bb = nodes_bb.union(response.final_rect);
-            if rect_selection_ended.is_some() {
-                node_rects.push((node_idx, response.final_rect));
-            }
+
+            measured_nodes.push(MeasuredNode {
+                id: node_idx,
+                open: response.open,
+                openness: response.openness,
+                draw_order_index: measured_nodes.len(),
+                pos: response.pos,
+                final_rect: response.final_rect,
+                screen_rect: to_global * response.final_rect,
+                remeasured: response.remeasured,
+            });
         }
     }
 
-    let mut hovered_wire = None;
-    let mut hovered_wire_disconnect = false;
-    let mut wire_shapes = Vec::new();
+    let scale = to_global.scaling;
+    let select_stroke = style.get_select_stroke(ui.style());
+    let upscale_wire_frame = style.get_upscale_wire_frame();
+    let downscale_wire_frame = style.get_downscale_wire_frame();
+    let base_tolerance = style.get_wire_hit_tolerance(wire_width, scale);
+    let wire_slack = style.get_wire_slack();
 
-    // Draw and interact with wires
-    for wire in snarl.wires.iter() {
-        let Some(from_r) = output_info.get(&wire.out_pin) else {
+    // Wires only move on their own when the style asks for it and egui animates at all.
+    let wire_sway = if ui.style().animation_time > 0.0 {
+        style.get_wire_sway()
+    } else {
+        0.0
+    };
+
+    let mut connected_wires: Vec<WirePins> = snarl
+        .wires
+        .iter()
+        .map(|wire| WirePins::new(wire.out_pin, wire.in_pin))
+        .collect();
+
+    // The set of wires has no order of its own. Sorting makes hover ties and paint order repeatable.
+    connected_wires.sort_unstable();
+
+    if let Some(selected) = snarl_state.selected_wire()
+        && connected_wires.binary_search(&selected).is_err()
+    {
+        snarl_state.select_wire(None);
+    }
+
+    // A click or touch on the canvas is still a candidate for a wire after the pointer is gone.
+    let canvas_clicked = snarl_resp
+        .flags
+        .intersects(Flags::CLICKED | Flags::LONG_TOUCHED);
+
+    let wire_pointer = latest_pos.filter(|&pos| {
+        !pointer_in_embedded_view
+            && !snarl_state.has_new_wires()
+            && !snarl_state.is_rect_selection()
+            && (snarl_resp.contains_pointer() || canvas_clicked)
+            && transform.viewport.contains(pos)
+            && !measured_nodes
+                .iter()
+                .any(|node| node.final_rect.contains(pos))
+    });
+
+    let sways_id = snarl_id.with("wire-sways");
+    let old_sways = if wire_sway > 0.0 {
+        ui.ctx()
+            .data(|d| d.get_temp::<WireSways>(sways_id))
+            .unwrap_or_default()
+    } else {
+        WireSways::default()
+    };
+    let mut new_sways = HashMap::new();
+    let mut wires_moving = false;
+    let stable_dt = ui.input(|i| i.stable_dt);
+
+    let mut laid_wires: Vec<LaidWire> = Vec::with_capacity(connected_wires.len());
+    let mut hovered_wire: Option<(usize, CableHit)> = None;
+
+    // Route every wire once. The path made here is the one painted and the one hit tested.
+    for &pins in &connected_wires {
+        let Some(from_r) = output_info.get(&pins.out_pin) else {
             continue;
         };
-        let Some(to_r) = input_info.get(&wire.in_pin) else {
+        let Some(to_r) = input_info.get(&pins.in_pin) else {
             continue;
         };
 
-        if !snarl_state.has_new_wires() && snarl_resp.contains_pointer() && hovered_wire.is_none() {
-            // Try to find hovered wire
-            // If not dragging new wire
-            // And not hovering over item above.
+        let (from, to) = (from_r.pos, to_r.pos);
+        let chord = from.distance(to);
 
-            if let Some(latest_pos) = latest_pos {
-                let wire_hit = hit_wire(
-                    ui.ctx(),
-                    WireId::Connected {
-                        snarl_id,
-                        out_pin: wire.out_pin,
-                        in_pin: wire.in_pin,
-                    },
-                    wire_frame_size,
-                    style.get_upscale_wire_frame(),
-                    style.get_downscale_wire_frame(),
-                    from_r.pos,
-                    to_r.pos,
-                    latest_pos,
-                    wire_width.max(2.0),
-                    pick_wire_style(from_r.wire_style, to_r.wire_style),
-                );
+        let mut sag = vec2(0.0, wire_slack * chord);
 
-                if wire_hit {
-                    hovered_wire = Some(wire);
+        if wire_sway > 0.0 {
+            let resting_middle = from.lerp(to, 0.5);
+            let (mut sway, last_middle) = old_sways
+                .0
+                .get(&pins)
+                .copied()
+                .unwrap_or((CableSway::default(), resting_middle));
 
-                    let wire_r =
-                        ui.interact(snarl_resp.rect, ui.make_persistent_id(wire), Sense::click());
+            wires_moving |= sway.advance(
+                resting_middle - last_middle,
+                wire_sway,
+                (chord * 0.25).min(wire_frame_size * 2.0),
+                stable_dt,
+            );
 
-                    //Remove hovered wire by second click
-                    hovered_wire_disconnect |= wire_r.clicked_by(PointerButton::Secondary);
-                }
-            }
+            sag += sway.offset();
+            new_sways.insert(pins, (sway, resting_middle));
         }
+
+        let wire_style = pick_wire_style(from_r.wire_style, to_r.wire_style);
+
+        let route = WireRoute {
+            pins: Some(pins),
+            from,
+            to,
+            style: wire_style,
+            frame_size: adjust_frame_size(
+                wire_frame_size,
+                upscale_wire_frame,
+                downscale_wire_frame,
+                from,
+                to,
+            ),
+            tolerance: wire_threshold,
+            sag,
+        };
+
+        let geometry = match viewer.wire_route(&route, snarl) {
+            Some(geometry) => Arc::new(geometry),
+            None => cached_default_route(
+                ui.ctx(),
+                WireId::Connected {
+                    snarl_id,
+                    out_pin: pins.out_pin,
+                    in_pin: pins.in_pin,
+                },
+                &route,
+            ),
+        };
 
         let color = mix_colors(from_r.wire_color, to_r.wire_color);
+        let selected = snarl_state.selected_wire() == Some(pins);
 
-        let mut draw_width = wire_width;
-        if hovered_wire == Some(wire) {
-            draw_width *= 1.5;
+        let paint = viewer.wire_paint(
+            &WireView {
+                pins: Some(pins),
+                geometry: &geometry,
+                hovered: false,
+                selected,
+                color,
+                width: wire_width,
+                scale,
+            },
+            default_wire_paint(color, wire_width, false, selected, select_stroke),
+            snarl,
+        );
+
+        let tolerance = base_tolerance.max(paint.hit_width() * 0.5);
+
+        if let Some(pos) = wire_pointer
+            && let Some(hit) = geometry.hit(pos, tolerance)
+            && hovered_wire.is_none_or(|(_, nearest)| hit.distance < nearest.distance)
+        {
+            hovered_wire = Some((laid_wires.len(), hit));
         }
 
-        draw_wire(
-            &ui,
-            WireId::Connected {
-                snarl_id,
-                out_pin: wire.out_pin,
-                in_pin: wire.in_pin,
-            },
-            &mut wire_shapes,
-            wire_frame_size,
-            style.get_upscale_wire_frame(),
-            style.get_downscale_wire_frame(),
-            from_r.pos,
-            to_r.pos,
-            Stroke::new(draw_width, color),
-            wire_threshold,
-            pick_wire_style(from_r.wire_style, to_r.wire_style),
-        );
+        laid_wires.push(LaidWire {
+            pins,
+            geometry,
+            paint,
+            color,
+            tolerance,
+        });
     }
 
-    // Remove hovered wire by second click
-    if hovered_wire_disconnect && let Some(wire) = hovered_wire {
-        let out_pin = OutPin::new(snarl, wire.out_pin);
-        let in_pin = InPin::new(snarl, wire.in_pin);
-        viewer.disconnect(&out_pin, &in_pin, snarl);
+    if wire_sway > 0.0 {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(sways_id, WireSways(Arc::new(new_sways))));
+        if wires_moving {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    // What was done to which wire this pass, and where on it.
+    let mut wire_event: Option<(WirePins, WireTrigger, CableAnchor)> = None;
+
+    if let Some((index, hit)) = hovered_wire {
+        let wire = &mut laid_wires[index];
+        let selected = snarl_state.selected_wire() == Some(wire.pins);
+
+        wire.paint = viewer.wire_paint(
+            &WireView {
+                pins: Some(wire.pins),
+                geometry: &wire.geometry,
+                hovered: true,
+                selected,
+                color: wire.color,
+                width: wire_width,
+                scale,
+            },
+            default_wire_paint(wire.color, wire_width, true, selected, select_stroke),
+            snarl,
+        );
+
+        let trigger = if snarl_resp.long_touched() {
+            Some(WireTrigger::LongTouch)
+        } else if snarl_resp.clicked_by(PointerButton::Secondary) {
+            Some(WireTrigger::SecondaryClick)
+        } else if snarl_resp.double_clicked() {
+            Some(WireTrigger::DoubleClick)
+        } else if snarl_resp.clicked_by(PointerButton::Primary) {
+            Some(WireTrigger::Click)
+        } else {
+            None
+        };
+
+        if let Some(trigger) = trigger {
+            // The click landed on the wire, so the canvas under it must not also open its
+            // menu, drop the selection or recentre the view.
+            snarl_resp
+                .flags
+                .remove(Flags::CLICKED | Flags::LONG_TOUCHED);
+
+            if matches!(trigger, WireTrigger::Click | WireTrigger::DoubleClick) {
+                snarl_state.select_wire(Some(wire.pins));
+                take_keyboard(ui.ctx(), snarl_id);
+            }
+
+            wire_event = Some((wire.pins, trigger, wire.geometry.anchor_at(hit.share)));
+        }
+    }
+
+    // Keys act on the selected wire of the view a wire was last selected in.
+    if wire_event.is_none()
+        && let Some(selected) = snarl_state.selected_wire()
+        && has_keyboard(ui.ctx(), snarl_id)
+        && !ui.ctx().egui_wants_keyboard_input()
+        && !egui::Popup::is_any_open(ui.ctx())
+        && let Some(wire) = laid_wires.iter().find(|wire| wire.pins == selected)
+    {
+        let trigger = ui.input_mut(|input| {
+            if input.consume_key(Modifiers::NONE, Key::Delete)
+                || input.consume_key(Modifiers::NONE, Key::Backspace)
+            {
+                Some(Some(WireTrigger::Delete))
+            } else if input.consume_key(Modifiers::NONE, Key::Enter)
+                || input.consume_key(Modifiers::NONE, Key::Space)
+            {
+                Some(Some(WireTrigger::Activate))
+            } else if input.consume_key(Modifiers::NONE, Key::Escape) {
+                Some(None)
+            } else {
+                None
+            }
+        });
+
+        match trigger {
+            Some(Some(trigger)) => {
+                wire_event = Some((selected, trigger, wire.geometry.midpoint()));
+            }
+            Some(None) => snarl_state.select_wire(None),
+            None => {}
+        }
+    }
+
+    let wire_menu_id = view_ids.wire_menu_popup_id();
+
+    if let Some((pins, trigger, anchor)) = wire_event {
+        let insertion = transform.insertion_anchor_from_graph(anchor.pos);
+
+        if trigger.asks_for_menu() && viewer.has_wire_menu(pins, snarl) {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(wire_menu_id, WireMenuTarget { pins, insertion });
+            });
+            egui::Popup::open_id(ui.ctx(), wire_menu_id);
+        } else {
+            viewer.wire_action(
+                &WireAction {
+                    wire: pins,
+                    trigger,
+                    anchor,
+                    insertion,
+                },
+                &mut ui,
+                snarl,
+            );
+        }
+
+        ui.ctx().request_repaint();
+    }
+
+    let mut wire_shapes = Vec::new();
+    for wire in &laid_wires {
+        wire.paint
+            .paint(&wire.geometry, ui.clip_rect(), &mut wire_shapes);
+    }
+
+    // Widgets riding on the middle of wires.
+    if !snarl_state.has_new_wires() {
+        for wire in &laid_wires {
+            if !viewer.has_wire_widget(&wire.pins.out_pin, &wire.pins.in_pin, snarl) {
+                continue;
+            }
+
+            let (Some(from_r), Some(to_r)) = (
+                output_info.get(&wire.pins.out_pin),
+                input_info.get(&wire.pins.in_pin),
+            ) else {
+                continue;
+            };
+
+            let widget_id = view_ids.wire_midpoint_id(wire.pins);
+            let known_size = ui.ctx().data(|d| d.get_temp::<Vec2>(widget_id));
+            let widget_rect = Rect::from_center_size(
+                wire.geometry.midpoint().pos,
+                known_size.unwrap_or(Vec2::ZERO),
+            )
+            .round_ui();
+
+            if known_size.is_some() {
+                let covers_pin =
+                    widget_rect.intersects(from_r.rect) || widget_rect.intersects(to_r.rect);
+
+                let behind_node = wire_layer == WireLayer::BehindNodes
+                    && measured_nodes
+                        .iter()
+                        .any(|node| node.final_rect.intersects(widget_rect));
+
+                if covers_pin || behind_node || !ui.is_rect_visible(widget_rect) {
+                    continue;
+                }
+            }
+
+            let mut builder = UiBuilder::new()
+                .scope_id(widget_id)
+                .max_rect(widget_rect)
+                .layout(Layout::left_to_right(Align::Center));
+
+            if known_size.is_none() {
+                // Measure first, show once the size is known and the widget can be centred.
+                builder = builder.sizing_pass().invisible();
+            }
+
+            let mut widget_ui = ui.new_child(builder);
+
+            viewer.show_wire_widget(
+                &OutPin::new(snarl, wire.pins.out_pin),
+                &InPin::new(snarl, wire.pins.in_pin),
+                &mut widget_ui,
+                snarl,
+            );
+
+            let measured_size = widget_ui.min_rect().size();
+            if known_size != Some(measured_size) {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(widget_id, measured_size));
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     if let Some(select_rect) = rect_selection_ended {
-        let select_nodes = node_rects.into_iter().filter_map(|(id, rect)| {
+        let select_nodes = measured_nodes.iter().filter_map(|node| {
             let select = if style.get_select_rect_contained() {
-                select_rect.contains_rect(rect)
+                select_rect.contains_rect(node.final_rect)
             } else {
-                select_rect.intersects(rect)
+                select_rect.intersects(node.final_rect)
             };
 
-            if select { Some(id) } else { None }
+            if select { Some(node.id) } else { None }
         });
 
         if modifiers.command {
@@ -1241,6 +1691,7 @@ where
 
     if snarl_resp.clicked_by(PointerButton::Primary) {
         snarl_state.deselect_all_nodes();
+        snarl_state.select_wire(None);
     }
 
     // Wire end position will be overridden when link graph menu is opened.
@@ -1289,6 +1740,10 @@ where
         }
     }
 
+    // Where the open menu inserts. Captured when a menu opens and kept while it stays open,
+    // so it does not follow the popup when egui moves the popup to keep it on screen.
+    let mut active_insertion_anchor = None;
+
     if let Some(interact_pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
         if let Some(new_wires) = snarl_state.take_new_wires_menu() {
             let pins = match &new_wires {
@@ -1297,7 +1752,7 @@ where
             };
 
             if viewer.has_dropped_wire_menu(pins, snarl) {
-                let popup_id = snarl_id.with("dropped_wire_popup");
+                let popup_id = view_ids.dropped_wire_popup_id();
                 let pos_id = snarl_id.with("dropped_wire_pos");
                 let force_open = snarl_resp.flags.contains(Flags::LONG_TOUCHED);
 
@@ -1321,62 +1776,133 @@ where
                             NewWires::Out(x) => AnyPins::Out(x),
                         };
                         wire_end_pos = menu_pos;
+                        active_insertion_anchor =
+                            Some(transform.insertion_anchor_from_graph(menu_pos));
                         viewer.show_dropped_wire_menu(menu_pos, ui, pins, snarl);
                         snarl_state.set_new_wires_menu(new_wires);
                     });
             }
         } else if viewer.has_graph_menu(interact_pos, snarl) {
+            let anchor_id = view_ids.graph_menu_popup_id();
+
+            if snarl_resp.secondary_clicked() {
+                let anchor = transform.insertion_anchor_from_screen(interact_pos);
+                ui.ctx().data_mut(|d| d.insert_temp(anchor_id, anchor));
+            }
+
+            let anchor = ui
+                .ctx()
+                .data(|d| d.get_temp::<InsertionAnchor>(anchor_id))
+                .unwrap_or_else(|| transform.insertion_anchor_from_screen(interact_pos));
+
             egui::Popup::context_menu(&snarl_resp)
+                .id(anchor_id)
                 .close_behavior(viewer.menu_close_behavior())
                 .show(|ui| {
-                    let menu_pos = from_global * ui.cursor().min;
-                    viewer.show_graph_menu(menu_pos, snarl_state.selected_nodes(), ui, snarl);
+                    active_insertion_anchor = Some(anchor);
+                    viewer.show_graph_menu(
+                        anchor.graph_pos,
+                        snarl_state.selected_nodes(),
+                        ui,
+                        snarl,
+                    );
                 });
         }
     }
 
-    match snarl_state.new_wires() {
-        None => {}
-        Some(NewWires::In(in_pins)) => {
-            for &in_pin in in_pins {
-                let from_pos = wire_end_pos;
-                let to_r = &input_info[&in_pin];
+    if egui::Popup::is_id_open(ui.ctx(), wire_menu_id) {
+        let target = ui
+            .ctx()
+            .data(|d| d.get_temp::<WireMenuTarget>(wire_menu_id))
+            .filter(|target| connected_wires.binary_search(&target.pins).is_ok());
 
-                draw_wire(
-                    &ui,
-                    WireId::NewInput { snarl_id, in_pin },
-                    &mut wire_shapes,
-                    wire_frame_size,
-                    style.get_upscale_wire_frame(),
-                    style.get_downscale_wire_frame(),
-                    from_pos,
-                    to_r.pos,
-                    Stroke::new(wire_width, to_r.wire_color),
-                    wire_threshold,
-                    to_r.wire_style,
-                );
-            }
+        if let Some(target) = target {
+            egui::Popup::context_menu(&snarl_resp)
+                .id(wire_menu_id)
+                .open_memory(None)
+                .anchor(egui::PopupAnchor::Position(
+                    target.insertion.visible_screen_pos,
+                ))
+                .close_behavior(viewer.menu_close_behavior())
+                .show(|ui| {
+                    active_insertion_anchor = Some(target.insertion);
+                    viewer.show_wire_menu(target.pins, target.insertion, ui, snarl);
+                });
+        } else {
+            // The wire is gone, and its menu with it.
+            egui::Popup::close_id(ui.ctx(), wire_menu_id);
         }
-        Some(NewWires::Out(out_pins)) => {
-            for &out_pin in out_pins {
-                let from_r = &output_info[&out_pin];
-                let to_pos = wire_end_pos;
+    }
 
-                draw_wire(
-                    &ui,
-                    WireId::NewOutput { snarl_id, out_pin },
-                    &mut wire_shapes,
-                    wire_frame_size,
-                    style.get_upscale_wire_frame(),
-                    style.get_downscale_wire_frame(),
-                    from_r.pos,
-                    to_pos,
-                    Stroke::new(wire_width, from_r.wire_color),
-                    wire_threshold,
-                    from_r.wire_style,
-                );
-            }
-        }
+    // Wires still being dragged are routed and painted like connected ones, but never hit tested.
+    let new_wire_ends: SmallVec<[(WireId, Pos2, Pos2, Color32, WireStyle); 4]> =
+        match snarl_state.new_wires() {
+            None => SmallVec::new(),
+            Some(NewWires::In(in_pins)) => in_pins
+                .iter()
+                .filter_map(|&in_pin| {
+                    let to_r = input_info.get(&in_pin)?;
+                    Some((
+                        WireId::NewInput { snarl_id, in_pin },
+                        wire_end_pos,
+                        to_r.pos,
+                        to_r.wire_color,
+                        to_r.wire_style,
+                    ))
+                })
+                .collect(),
+            Some(NewWires::Out(out_pins)) => out_pins
+                .iter()
+                .filter_map(|&out_pin| {
+                    let from_r = output_info.get(&out_pin)?;
+                    Some((
+                        WireId::NewOutput { snarl_id, out_pin },
+                        from_r.pos,
+                        wire_end_pos,
+                        from_r.wire_color,
+                        from_r.wire_style,
+                    ))
+                })
+                .collect(),
+        };
+
+    for (wire_id, from, to, color, wire_style) in new_wire_ends {
+        let route = WireRoute {
+            pins: None,
+            from,
+            to,
+            style: wire_style,
+            frame_size: adjust_frame_size(
+                wire_frame_size,
+                upscale_wire_frame,
+                downscale_wire_frame,
+                from,
+                to,
+            ),
+            tolerance: wire_threshold,
+            sag: vec2(0.0, wire_slack * from.distance(to)),
+        };
+
+        let geometry = match viewer.wire_route(&route, snarl) {
+            Some(geometry) => Arc::new(geometry),
+            None => cached_default_route(ui.ctx(), wire_id, &route),
+        };
+
+        let paint = viewer.wire_paint(
+            &WireView {
+                pins: None,
+                geometry: &geometry,
+                hovered: false,
+                selected: false,
+                color,
+                width: wire_width,
+                scale,
+            },
+            default_wire_paint(color, wire_width, false, false, select_stroke),
+            snarl,
+        );
+
+        paint.paint(&geometry, ui.clip_rect(), &mut wire_shapes);
     }
 
     match wire_shape_idx {
@@ -1412,6 +1938,53 @@ where
     {
         snarl_state.select_many_nodes(true, selected_nodes.into_iter());
     }
+
+    let measure_pin = |pin: AnyPin, measured: &PinResponse| MeasuredPin {
+        pin,
+        widget_id: measured.widget_id,
+        graph_center: measured.pos,
+        screen_center: to_global * measured.pos,
+        graph_rect: measured.rect,
+        row_rect: measured.row_rect,
+        wire_color: measured.wire_color,
+        wire_style: measured.wire_style,
+    };
+
+    let selected_wire = snarl_state.selected_wire();
+    let hovered_pins = hovered_wire.map(|(index, _)| laid_wires[index].pins);
+
+    let anatomy = SnarlAnatomy {
+        view_ids,
+        transform,
+        nodes: measured_nodes,
+        input_pins: input_info
+            .iter()
+            .map(|(&pin, measured)| (pin, measure_pin(AnyPin::In(pin), measured)))
+            .collect(),
+        output_pins: output_info
+            .iter()
+            .map(|(&pin, measured)| (pin, measure_pin(AnyPin::Out(pin), measured)))
+            .collect(),
+        wires: laid_wires
+            .into_iter()
+            .map(|wire| MeasuredWire {
+                hovered: hovered_pins == Some(wire.pins),
+                selected: selected_wire == Some(wire.pins),
+                pins: wire.pins,
+                geometry: wire.geometry,
+                paint: wire.paint,
+                hit_tolerance: wire.tolerance,
+            })
+            .collect(),
+        active_insertion_anchor,
+        selected_nodes: snarl_state.selected_nodes().to_vec(),
+        selected_wire,
+        embedded: host.parent_view.is_some(),
+        pointer_in_embedded_view,
+    }
+    .store(ui.ctx());
+
+    viewer.measured(&anatomy, &mut ui, snarl);
 
     snarl_state.store(snarl, ui.ctx());
 
@@ -1454,6 +2027,7 @@ fn draw_inputs<T, V>(
     modifiers: Modifiers,
     input_positions: &mut HashMap<InPinId, PinResponse>,
     heights: Heights,
+    view_ids: SnarlViewIds,
 ) -> DrawPinsResponse
 where
     V: SnarlViewer<T>,
@@ -1496,7 +2070,6 @@ where
             }
 
             let y0 = pin_ui.max_rect().min.y;
-            let y1 = pin_ui.max_rect().max.y;
 
             // Show input content
             let snarl_pin = viewer.show_input(in_pin, pin_ui, snarl);
@@ -1505,17 +2078,26 @@ where
                 return;
             }
 
+            // The row was allotted the height its content had last pass. Place the pin on the
+            // row as its content measured just now, so a row that wraps or resizes carries
+            // its pin with it in the same pass.
+            let row_rect = pin_ui.min_rect();
+            let y1 = row_rect.max.y.max(y0);
+
             let pin_rect = snarl_pin.pin_rect(
                 input_x,
                 min_pin_y_top.max(y0),
                 min_pin_y_bottom.max(y1),
-                pin_size,
+                snarl_pin.pin_size(pin_size).max(0.0),
             );
 
             // Interact with pin shape.
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            // The id names the pin, not its place among the widgets of the row, so it survives
+            // rows gaining and losing widgets.
+            let widget_id = view_ids.in_pin_id(in_pin.id);
+            let r = pin_ui.interact(pin_rect, widget_id, Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1571,6 +2153,9 @@ where
                 in_pin.id,
                 PinResponse {
                     pos: r.rect.center(),
+                    rect: r.rect,
+                    row_rect,
+                    widget_id,
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                 },
@@ -1613,6 +2198,7 @@ fn draw_outputs<T, V>(
     modifiers: Modifiers,
     output_positions: &mut HashMap<OutPinId, PinResponse>,
     heights: Heights,
+    view_ids: SnarlViewIds,
 ) -> DrawPinsResponse
 where
     V: SnarlViewer<T>,
@@ -1656,7 +2242,6 @@ where
             }
 
             let y0 = pin_ui.max_rect().min.y;
-            let y1 = pin_ui.max_rect().max.y;
 
             // Show output content
             let snarl_pin = viewer.show_output(out_pin, pin_ui, snarl);
@@ -1665,16 +2250,21 @@ where
                 return;
             }
 
+            // See `draw_inputs`: the pin follows the row as measured this pass.
+            let row_rect = pin_ui.min_rect();
+            let y1 = row_rect.max.y.max(y0);
+
             let pin_rect = snarl_pin.pin_rect(
                 output_x,
                 min_pin_y_top.max(y0),
                 min_pin_y_bottom.max(y1),
-                pin_size,
+                snarl_pin.pin_size(pin_size).max(0.0),
             );
 
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            let widget_id = view_ids.out_pin_id(out_pin.id);
+            let r = pin_ui.interact(pin_rect, widget_id, Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1731,6 +2321,9 @@ where
                 out_pin.id,
                 PinResponse {
                     pos: r.rect.center(),
+                    rect: r.rect,
+                    row_rect,
+                    widget_id,
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                 },
@@ -1797,7 +2390,7 @@ fn draw_node<T, V>(
     viewer: &mut V,
     snarl_state: &mut SnarlState,
     style: &SnarlStyle,
-    snarl_id: Id,
+    view_ids: SnarlViewIds,
     input_positions: &mut HashMap<InPinId, PinResponse>,
     modifiers: Modifiers,
     output_positions: &mut HashMap<OutPinId, PinResponse>,
@@ -1826,7 +2419,7 @@ where
     let node_pos = pos.round_ui();
 
     // Generate persistent id for the node.
-    let node_id = snarl_id.with(("snarl-node", node));
+    let node_id = view_ids.node_id(node);
 
     let openness = ui.ctx().animate_bool(node_id, open);
 
@@ -1896,7 +2489,7 @@ where
     // Interact with node frame.
     let r = node_ui.interact(
         node_frame_rect.round_ui(),
-        node_id.with("frame"),
+        view_ids.node_frame_id(node),
         Sense::click_and_drag(),
     );
 
@@ -2051,6 +2644,7 @@ where
                     modifiers,
                     input_positions,
                     node_layout.input_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_input_heights = r.new_heights;
@@ -2089,6 +2683,7 @@ where
                     modifiers,
                     output_positions,
                     node_layout.output_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_output_heights = r.new_heights;
@@ -2176,6 +2771,7 @@ where
                     modifiers,
                     input_positions,
                     node_layout.input_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_input_heights = r.new_heights;
@@ -2251,6 +2847,7 @@ where
                     modifiers,
                     output_positions,
                     node_layout.output_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_output_heights = r.new_heights;
@@ -2300,6 +2897,7 @@ where
                     modifiers,
                     output_positions,
                     node_layout.output_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_output_heights = r.new_heights;
@@ -2375,6 +2973,7 @@ where
                     modifiers,
                     input_positions,
                     node_layout.input_heights(&node_state),
+                    view_ids,
                 );
 
                 let new_input_heights = r.new_heights;
@@ -2504,6 +3103,7 @@ where
 
     viewer.final_node_rect(node, r.response.rect, ui, snarl);
 
+    let remeasured = node_state.is_dirty();
     node_state.store(ui.ctx());
     Some(DrawNodeResponse {
         node_moved,
@@ -2511,6 +3111,10 @@ where
         drag_released,
         pin_hovered,
         final_rect: r.response.rect,
+        pos,
+        open,
+        openness,
+        remeasured,
     })
 }
 

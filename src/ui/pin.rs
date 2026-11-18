@@ -4,9 +4,13 @@ use crate::{InPinId, OutPinId};
 
 use super::{SnarlStyle, WireStyle};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Identifier for either an output pin or an input pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnyPin {
+    /// Output pin identifier.
     Out(OutPinId),
+    /// Input pin identifier.
     In(InPinId),
 }
 
@@ -35,6 +39,16 @@ pub struct PinWireInfo {
 
 /// Uses `Painter` to draw a pin.
 pub trait SnarlPin {
+    /// Side of the square the pin is drawn and grabbed in.
+    ///
+    /// `default_size` comes from [`SnarlStyle::pin_size`]. Return something else to make this
+    /// pin larger or smaller than the others. The space rows reserve beside their content
+    /// still follows `default_size`.
+    #[must_use]
+    fn pin_size(&self, default_size: f32) -> f32 {
+        default_size
+    }
+
     /// Calculates pin Rect from the given parameters.
     fn pin_rect(&self, x: f32, y0: f32, y1: f32, size: f32) -> Rect {
         // Center vertically by default.
@@ -101,8 +115,12 @@ pub struct PinInfo {
     /// Style of the wire connected to the pin.
     pub wire_style: Option<WireStyle>,
 
-    /// Custom vertical position of a pin
+    /// Custom normalized vertical position of a pin within its measured row (`0.0..=1.0`).
     pub position: Option<f32>,
+
+    /// Optional per-pin size override in graph units.
+    /// If `None`, [`SnarlStyle::pin_size`] is used.
+    pub size: Option<f32>,
 }
 
 impl PinInfo {
@@ -138,6 +156,20 @@ impl PinInfo {
     #[must_use]
     pub const fn with_wire_color(mut self, wire_color: Color32) -> Self {
         self.wire_color = Some(wire_color);
+        self
+    }
+
+    /// Sets the normalized vertical position (`0.0..=1.0`) of the pin within its measured row.
+    #[must_use]
+    pub const fn with_position(mut self, position: f32) -> Self {
+        self.position = Some(position);
+        self
+    }
+
+    /// Sets a per-pin size override in graph units.
+    #[must_use]
+    pub const fn with_size(mut self, size: f32) -> Self {
+        self.size = Some(size);
         self
     }
 
@@ -222,6 +254,21 @@ impl PinInfo {
 }
 
 impl SnarlPin for PinInfo {
+    fn pin_size(&self, default_size: f32) -> f32 {
+        match self.size {
+            Some(size) if size.is_finite() => size.max(0.0),
+            _ => default_size,
+        }
+    }
+
+    fn pin_rect(&self, x: f32, y0: f32, y1: f32, size: f32) -> Rect {
+        let y = match self.position {
+            Some(t) if t.is_finite() => egui::lerp(y0..=y1, t.clamp(0.0, 1.0)),
+            _ => f32::midpoint(y0, y1),
+        };
+        Rect::from_center_size(pos2(x, y), vec2(size, size))
+    }
+
     fn draw(
         self,
         snarl_style: &SnarlStyle,

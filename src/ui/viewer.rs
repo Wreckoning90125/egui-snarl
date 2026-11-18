@@ -4,7 +4,10 @@ use crate::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 
 use super::{
     BackgroundPattern, NodeLayout, SnarlStyle,
+    anatomy::{InsertionAnchor, SnarlAnatomy, WireAction, WireTrigger, WireView},
+    cable::CableGeometry,
     pin::{AnyPins, SnarlPin},
+    wire::{WirePaint, WirePins, WireRoute},
 };
 
 /// `SnarlViewer` is a trait for viewing a Snarl.
@@ -216,6 +219,9 @@ pub trait SnarlViewer<T> {
 
     /// Checks if wire has something to show in widget.
     /// This may not be called if wire is invisible.
+    ///
+    /// The widget is laid out centred on the midpoint of the wire's path.
+    /// It is left out while it would cover either pin of the wire, and while a wire is being dragged.
     #[inline]
     fn has_wire_widget(&mut self, from: &OutPinId, to: &InPinId, snarl: &Snarl<T>) -> bool {
         let _ = (from, to, snarl);
@@ -229,6 +235,96 @@ pub trait SnarlViewer<T> {
         let _ = (from, to, ui, snarl);
     }
 
+    /// Lays out the path of a wire.
+    ///
+    /// Return `None` to use [`WireRoute::default_route`], which follows the wire style, slack and sway.
+    /// A returned path is used as is for painting, hit testing, bounds and anchors.
+    /// It should start at `route.from` and end at `route.to`; those are the measured pin centres.
+    ///
+    /// Called for every visible wire on every pass, so keep it cheap or cache by `route`.
+    #[inline]
+    fn wire_route(&mut self, route: &WireRoute, snarl: &Snarl<T>) -> Option<CableGeometry> {
+        let _ = (route, snarl);
+        None
+    }
+
+    /// Decides how a wire is painted along its path.
+    ///
+    /// `default` is one stroke of the mixed pin colour, half again as wide while the wire is
+    /// hovered or selected. Return it to keep that look, or build a [`WirePaint`] from layered
+    /// strokes: a casing, a core, a glow. Return [`WirePaint::hidden`] to paint the wire yourself.
+    ///
+    /// Called once for every visible wire on every pass with `wire.hovered` false to learn how
+    /// wide the wire is, and once more for the wire the pointer turns out to be on.
+    #[inline]
+    fn wire_paint(
+        &mut self,
+        wire: &WireView<'_>,
+        default: WirePaint,
+        snarl: &Snarl<T>,
+    ) -> WirePaint {
+        let _ = (wire, snarl);
+        default
+    }
+
+    /// Reacts to something done to a wire with the pointer, a touch or the keyboard.
+    ///
+    /// Not called for triggers that open the wire menu when [`SnarlViewer::has_wire_menu`]
+    /// returns `true` for the wire.
+    ///
+    /// By default a secondary click, and Delete or Backspace on the selected wire, ask
+    /// [`SnarlViewer::disconnect`] to remove the wire. Everything else does nothing.
+    ///
+    /// Dragging from a pin to reconnect, dragging a node and panning the view are never
+    /// reported here; they stay with the pins, the nodes and the view.
+    #[inline]
+    fn wire_action(&mut self, action: &WireAction, ui: &mut Ui, snarl: &mut Snarl<T>) {
+        let _ = ui;
+        if matches!(
+            action.trigger,
+            WireTrigger::SecondaryClick | WireTrigger::Delete
+        ) {
+            let from = OutPin::new(snarl, action.wire.out_pin);
+            let to = InPin::new(snarl, action.wire.in_pin);
+            self.disconnect(&from, &to, snarl);
+        }
+    }
+
+    /// Checks if the wire has a context menu.
+    ///
+    /// When it does, a secondary click or long touch on the wire, and Enter or Space on the
+    /// selected wire, open that menu instead of being reported to [`SnarlViewer::wire_action`].
+    #[inline]
+    fn has_wire_menu(&mut self, wire: WirePins, snarl: &mut Snarl<T>) -> bool {
+        let _ = (wire, snarl);
+        false
+    }
+
+    /// Shows the context menu of a wire.
+    ///
+    /// `anchor` is the point of the wire the menu was opened at: under the pointer, or the
+    /// midpoint when opened from the keyboard. It stays put while the menu is open, wherever
+    /// the popup itself ends up on screen, so it is safe to insert a node there.
+    #[inline]
+    fn show_wire_menu(
+        &mut self,
+        wire: WirePins,
+        anchor: InsertionAnchor,
+        ui: &mut Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        let _ = (wire, anchor, ui, snarl);
+    }
+
+    /// Reports what the view measured this pass, after everything has been laid out and painted.
+    ///
+    /// `ui` paints into the graph layer, in graph coordinates, above nodes and wires.
+    /// The same data is available afterwards from [`get_snarl_anatomy`](super::get_snarl_anatomy).
+    #[inline]
+    fn measured(&mut self, anatomy: &SnarlAnatomy, ui: &mut Ui, snarl: &mut Snarl<T>) {
+        let _ = (anatomy, ui, snarl);
+    }
+
     /// Checks if the snarl has something to show in context menu if right-clicked or long-touched on empty space at `pos`.
     #[inline]
     fn has_graph_menu(&mut self, pos: Pos2, snarl: &mut Snarl<T>) -> bool {
@@ -239,6 +335,9 @@ pub trait SnarlViewer<T> {
     /// Show context menu for the snarl.
     ///
     /// This can be used to implement menu for adding new nodes.
+    ///
+    /// `pos` is the point of the graph the menu was opened at. It stays put while the menu is
+    /// open, even when the popup is moved to fit on screen.
     #[inline]
     fn show_graph_menu(
         &mut self,

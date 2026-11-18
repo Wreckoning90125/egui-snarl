@@ -8,7 +8,7 @@ use smallvec::{SmallVec, ToSmallVec, smallvec};
 
 use crate::{InPinId, NodeId, OutPinId, Snarl};
 
-use super::{SnarlWidget, transform_matching_points};
+use super::{SnarlWidget, transform_matching_points, wire::WirePins};
 
 pub type RowHeights = SmallVec<[f32; 8]>;
 
@@ -71,6 +71,11 @@ impl NodeState {
             });
             cx.request_repaint();
         }
+    }
+
+    /// Whether anything measured this pass differs from what was stored.
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Finds node rect at specific position (excluding node frame margin).
@@ -178,6 +183,44 @@ pub struct SnarlState {
 
     /// List of currently selected nodes.
     selected_nodes: SmallVec<[NodeId; 8]>,
+
+    /// Wire selected at the start of this pass, to tell whether it changed.
+    loaded_selected_wire: Option<WirePins>,
+
+    /// Currently selected wire.
+    selected_wire: Option<WirePins>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SelectedWire(Option<WirePins>);
+
+/// The view whose selected wire the keyboard acts on.
+#[derive(Clone, Copy)]
+struct KeyboardView(Id);
+
+pub fn take_keyboard(cx: &Context, id: Id) {
+    cx.data_mut(|d| d.insert_temp(Id::NULL, KeyboardView(id)));
+}
+
+pub fn has_keyboard(cx: &Context, id: Id) -> bool {
+    cx.data(|d| d.get_temp::<KeyboardView>(Id::NULL))
+        .is_some_and(|view| view.0 == id)
+}
+
+impl SelectedWire {
+    fn save(self, cx: &Context, id: Id) {
+        cx.data_mut(|d| {
+            if self.0.is_none() {
+                d.remove_temp::<Self>(id);
+            } else {
+                d.insert_temp::<Self>(id, self);
+            }
+        });
+    }
+
+    fn load(cx: &Context, id: Id) -> Self {
+        cx.data(|d| d.get_temp::<Self>(id)).unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -263,6 +306,7 @@ impl SnarlState {
         let dirty = prune_selected_nodes(&mut selected_nodes, snarl);
 
         let draw_order = DrawOrder::load(cx, id).0;
+        let selected_wire = SelectedWire::load(cx, id).0;
 
         SnarlState {
             to_global: data.to_global,
@@ -273,6 +317,8 @@ impl SnarlState {
             rect_selection: data.rect_selection,
             draw_order,
             selected_nodes,
+            loaded_selected_wire: selected_wire,
+            selected_wire,
         }
     }
 
@@ -305,12 +351,19 @@ impl SnarlState {
             draw_order: Vec::new(),
             rect_selection: None,
             selected_nodes: SmallVec::new(),
+            loaded_selected_wire: None,
+            selected_wire: None,
         }
     }
 
     #[inline(always)]
     pub fn store<T>(mut self, snarl: &Snarl<T>, cx: &Context) {
         self.dirty |= prune_selected_nodes(&mut self.selected_nodes, snarl);
+
+        if self.selected_wire != self.loaded_selected_wire {
+            SelectedWire(self.selected_wire).save(cx, self.id);
+            cx.request_repaint();
+        }
 
         if self.dirty {
             let data = SnarlStateData {
@@ -559,6 +612,14 @@ impl SnarlState {
         self.selected_nodes.clear();
     }
 
+    pub const fn selected_wire(&self) -> Option<WirePins> {
+        self.selected_wire
+    }
+
+    pub const fn select_wire(&mut self, wire: Option<WirePins>) {
+        self.selected_wire = wire;
+    }
+
     pub const fn start_rect_selection(&mut self, pos: Pos2) {
         self.dirty |= self.rect_selection.is_none();
         self.rect_selection = Some(RectSelect {
@@ -642,4 +703,27 @@ pub fn update_selected_nodes(id: Id, ctx: &Context, f: impl FnOnce(&mut Vec<Node
         f(&mut nodes);
         selection.0 = SmallVec::from_vec(nodes);
     });
+}
+
+/// Returns the wire selected in the UI for the `SnarlWidget` with same ID.
+///
+/// Only works if [`SnarlWidget::id`] was used.
+#[must_use]
+#[inline]
+pub fn get_selected_wire(id: Id, ctx: &Context) -> Option<WirePins> {
+    SelectedWire::load(ctx, id).0
+}
+
+/// Selects a wire, or none, in the UI for the `SnarlWidget` with same ID.
+///
+/// Keyboard actions on wires apply to the selected wire, so this is how a wire is chosen
+/// without a pointer. A wire the graph does not hold is deselected on the next pass.
+///
+/// Only works if [`SnarlWidget::id`] was used.
+pub fn set_selected_wire(id: Id, ctx: &Context, wire: Option<WirePins>) {
+    SelectedWire(wire).save(ctx, id);
+    if wire.is_some() {
+        take_keyboard(ctx, id);
+    }
+    ctx.request_repaint();
 }
