@@ -1232,7 +1232,6 @@ where
 
     let wire_frame_size = style.get_wire_frame_size(ui.style());
     let wire_width = style.get_wire_width(ui.style());
-    let wire_threshold = style.get_wire_smoothness();
     let wire_layer = style.get_wire_layer();
 
     let wire_shape_idx = match wire_layer {
@@ -1298,6 +1297,10 @@ where
     }
 
     let scale = to_global.scaling;
+
+    // Smoothness is given in graph units. A magnified view samples routes more finely, so
+    // that a wire is as smooth on screen as it is at natural size.
+    let wire_threshold = style.get_wire_smoothness() / scale.max(1.0);
     let select_stroke = style.get_select_stroke(ui.style());
     let upscale_wire_frame = style.get_upscale_wire_frame();
     let downscale_wire_frame = style.get_downscale_wire_frame();
