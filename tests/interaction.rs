@@ -25,6 +25,10 @@ const INNER_SIZE: Vec2 = vec2(260.0, 170.0);
 const BEAD: Color32 = Color32::from_rgb(250, 240, 20);
 const BEAD_RADIUS: f32 = 5.0;
 
+/// Colours no pin, node or default wire is drawn in.
+const TUBE_FILL: Color32 = Color32::from_rgb(20, 250, 240);
+const TUBE_WALL: Color32 = Color32::from_rgb(240, 20, 250);
+
 fn view(name: &str) -> Id {
     Id::unique(name)
 }
@@ -64,6 +68,10 @@ struct Viewer {
 
     /// Where along every wire a disc is placed, as shares of its length.
     beads: Vec<f32>,
+
+    /// A wire routed and painted as a tube that bulges and bends, and the moment it is at:
+    /// where along the wire the bulge is, as a share of its length.
+    tube: Option<(WirePins, f32)>,
 
     /// A wire painted in a layer of its own choosing, and that layer.
     layered: Option<(WirePins, WireLayer)>,
@@ -179,6 +187,20 @@ impl SnarlViewer<Node> for Viewer {
     }
 
     fn wire_route(&mut self, route: &WireRoute, _snarl: &Snarl<Node>) -> Option<CableGeometry> {
+        if let Some((pins, moment)) = self.tube
+            && route.pins == Some(pins)
+        {
+            // The default path, bowed sideways between its fixed ends, with a bulge on it.
+            let path = route.default_route().subdivided(3.0);
+            let bowed = CableGeometry::from_points(
+                path.offset(|share| 18.0 * moment * (std::f32::consts::PI * share).sin()),
+            );
+            return Some(bowed.with_radii(|share| {
+                let from_bulge = (share - moment) / 0.07;
+                14.0f32.mul_add((-from_bulge * from_bulge).exp(), 1.5)
+            }));
+        }
+
         if let Some(lead) = self.screen_lead {
             let lead = vec2(lead / route.scale, 0.0);
             return Some(CableGeometry::from_points([
@@ -201,7 +223,13 @@ impl SnarlViewer<Node> for Viewer {
         default: WirePaint,
         _snarl: &Snarl<Node>,
     ) -> WirePaint {
-        let paint = if self.glow {
+        let paint = if wire.geometry.radii().is_some() {
+            let [near, far] = wire.geometry.walls();
+            WirePaint::hidden()
+                .under_shape(wire.geometry.ribbon(|_| TUBE_FILL))
+                .over_shape(Shape::line(near, (1.0, TUBE_WALL)))
+                .over_shape(Shape::line(far, (1.0, TUBE_WALL)))
+        } else if self.glow {
             WirePaint::solid((6.0, wire.color)).with_glow(Color32::from_rgb(255, 140, 60), 8.0)
         } else {
             default
@@ -897,6 +925,234 @@ fn one_wire_can_be_painted_above_the_nodes_while_the_rest_stay_behind() {
             .unwrap();
         world.move_to(over_node);
         assert_eq!(world.outer().hovered_wire().map(|wire| wire.pins), None);
+    }
+}
+
+/// The meshes in the output with the clip rectangle each is painted in.
+fn meshes(output: &FullOutput) -> Vec<(Rect, Arc<egui::Mesh>)> {
+    fn take_apart(shape: &Shape, clip: Rect, meshes: &mut Vec<(Rect, Arc<egui::Mesh>)>) {
+        match shape {
+            Shape::Vec(group) => {
+                for shape in group {
+                    take_apart(shape, clip, meshes);
+                }
+            }
+            Shape::Mesh(mesh) => meshes.push((clip, mesh.clone())),
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        take_apart(&clipped.shape, clipped.clip_rect, &mut found);
+    }
+    found
+}
+
+#[test]
+fn a_tube_that_moves_is_picked_between_the_walls_it_is_painted_with() {
+    let (snarl, wire) = pair(true);
+    let mut world = World::new(snarl, Viewer::default());
+
+    let mut scales = Vec::new();
+
+    for zoom in [1.0, 0.4, 1.7] {
+        let spot = empty_spot(&world.outer());
+        world.zoom_at(spot, zoom);
+        scales.push(world.outer().transform.scale());
+
+        let mut bulges = Vec::new();
+
+        for moment in [0.35, 0.5, 0.65] {
+            world.viewer.tube = Some((wire, moment));
+            world.move_to(spot);
+            let output = world.settle();
+
+            let anatomy = world.outer();
+            let scale = anatomy.transform.scale();
+            let measured = anatomy.wire(wire).expect("the wire was measured");
+            let on_screen = measured.geometry.transformed(anatomy.transform.to_global);
+
+            // The tube still runs from one measured pin centre to the other.
+            assert_eq!(
+                measured.geometry.start(),
+                anatomy.out_pin(wire.out_pin).unwrap().graph_center
+            );
+            assert_eq!(
+                measured.geometry.end(),
+                anatomy.in_pin(wire.in_pin).unwrap().graph_center
+            );
+
+            // What is painted is the area between the walls of the measured path, as it is
+            // at this moment, and the two walls themselves.
+            let [near, far] = on_screen.walls();
+            let found = meshes(&output);
+            assert_eq!(found.len(), 1, "one ribbon");
+            let (clip, mesh) = &found[0];
+            assert_eq!(mesh.vertices.len(), 2 * near.len());
+            for (index, pair) in mesh.vertices.chunks(2).enumerate() {
+                assert_close(pair[0].pos, near[index], 0.05, "ribbon edge");
+                assert_close(pair[1].pos, far[index], 0.05, "ribbon edge");
+                assert_eq!(pair[0].color, TUBE_FILL);
+            }
+            assert_eq!(painted_along(&output, &near), 1, "one wall");
+            assert_eq!(painted_along(&output, &far), 1, "the other wall");
+            assert_eq!(painted_along(&output, on_screen.points()), 0, "no stroke");
+
+            // It is clipped to the view, as any wire is.
+            assert!(
+                clip.min.distance(anatomy.transform.global_clip_rect.min) < 0.5
+                    && clip.max.distance(anatomy.transform.global_clip_rect.max) < 0.5,
+                "{clip:?} is not {:?}",
+                anatomy.transform.global_clip_rect
+            );
+
+            // The pointer is on the tube anywhere inside the bulge, well beyond the band a
+            // thin wire is picked in, and off it at the same distance where the tube is thin.
+            let bulge = on_screen.anchor_at(moment);
+            let reach = on_screen.radius_at(moment) - 1.5;
+            assert!((on_screen.radius_at(moment) - 15.5 * scale).abs() < 0.2 * scale);
+            assert!(
+                reach > 6.0 + 1.0,
+                "scale {scale}: the bulge is wider than the band"
+            );
+
+            let thin = on_screen.anchor_at(moment - 0.25);
+            assert!(on_screen.radius_at(moment - 0.25) < 2.0 * scale);
+
+            for side in [-1.0, 1.0] {
+                world.move_to(bulge.pos + bulge.normal * (side * reach));
+                let hovered = world.outer().hovered_wire().map(|wire| wire.pins);
+                assert_eq!(hovered, Some(wire), "moment {moment}, scale {scale}");
+
+                world.move_to(thin.pos + thin.normal * (side * reach));
+                let hovered = world.outer().hovered_wire().map(|wire| wire.pins);
+                assert_eq!(hovered, None, "moment {moment}, scale {scale}");
+            }
+
+            // Just outside the wall of the bulge the pointer is off the tube.
+            world.move_to(bulge.pos + bulge.normal * (reach + 3.0));
+            assert_eq!(world.outer().hovered_wire().map(|wire| wire.pins), None);
+
+            bulges.push(bulge.pos + bulge.normal * reach);
+        }
+
+        // The bulge has moved on: where it was at the first moment, the tube is now thin
+        // and bowed away, and the pointer is no longer on it.
+        assert!(bulges[0].distance(bulges[2]) > 20.0);
+        world.move_to(bulges[0]);
+        assert_eq!(world.outer().hovered_wire().map(|wire| wire.pins), None);
+        world.move_to(bulges[2]);
+        assert_eq!(
+            world.outer().hovered_wire().map(|wire| wire.pins),
+            Some(wire)
+        );
+    }
+
+    assert!(
+        scales[1] < 0.9 && scales[2] > 1.1,
+        "checked both reduced and magnified: {scales:?}"
+    );
+
+    // A click inside the bulge acts on the wire, at the point of its path nearest to it.
+    let anatomy = world.outer();
+    let on_screen = anatomy
+        .wire(wire)
+        .unwrap()
+        .geometry
+        .transformed(anatomy.transform.to_global);
+    let bulge = on_screen.anchor_at(0.65);
+    let inside = bulge.pos + bulge.normal * (on_screen.radius_at(0.65) - 1.5);
+
+    world.click(inside, PointerButton::Primary);
+    assert_eq!(world.viewer.actions.len(), 1);
+    assert_eq!(world.viewer.actions[0].wire, wire);
+    assert_eq!(world.viewer.actions[0].trigger, WireTrigger::Click);
+    assert_close(
+        world.viewer.actions[0].insertion.screen_pos,
+        bulge.pos,
+        1.0,
+        "the point on the path under the click",
+    );
+
+    // The same graph without the tube paints no shape of the viewer's.
+    world.viewer.tube = None;
+    world.move_to(empty_spot(&world.outer()));
+    let output = world.settle();
+    assert!(meshes(&output).is_empty());
+}
+
+#[test]
+fn shapes_a_viewer_adds_to_a_wire_are_painted_in_the_layer_of_that_wire() {
+    for (style_layer, own_layer) in [
+        (WireLayer::BehindNodes, None),
+        (WireLayer::AboveNodes, None),
+        (WireLayer::BehindNodes, Some(WireLayer::AboveNodes)),
+        (WireLayer::AboveNodes, Some(WireLayer::BehindNodes)),
+    ] {
+        // A tube from the left node to the right one, passing the node in between.
+        let mut snarl = Snarl::new();
+        let left = snarl.insert_node(pos2(0.0, 0.0), Node::plain("left", 0, 1));
+        let between = snarl.insert_node(pos2(190.0, 0.0), Node::plain("between", 1, 0));
+        let right = snarl.insert_node(pos2(420.0, 0.0), Node::plain("right", 1, 0));
+
+        let tube = WirePins::new(out_pin(left, 0), in_pin(right, 0));
+        snarl.connect(tube.out_pin, tube.in_pin);
+
+        let mut world = World::new(
+            snarl,
+            Viewer {
+                tube: Some((tube, 0.5)),
+                layered: own_layer.map(|layer| (tube, layer)),
+                ..Viewer::default()
+            },
+        );
+        world.style.wire_layer = Some(style_layer);
+
+        let spot = empty_spot(&world.outer());
+        world.move_to(spot);
+        let output = world.settle();
+        let anatomy = world.outer();
+        let shapes = painted(&output);
+
+        let frame = anatomy.node(between).unwrap().screen_rect;
+        let node = shapes
+            .iter()
+            .position(|shape| {
+                matches!(shape, Shape::Rect(rect)
+                if rect.rect.min.distance(frame.min) < 0.5 && rect.rect.max.distance(frame.max) < 0.5)
+            })
+            .expect("the frame of the node in between was painted");
+
+        let on_screen = anatomy
+            .wire(tube)
+            .unwrap()
+            .geometry
+            .transformed(anatomy.transform.to_global);
+        assert!(
+            on_screen
+                .points()
+                .iter()
+                .any(|&point| frame.shrink(2.0).contains(point)),
+            "the tube passes the node in between"
+        );
+
+        let [near, far] = on_screen.walls();
+        let ribbon = shapes
+            .iter()
+            .position(|shape| matches!(shape, Shape::Mesh(_)))
+            .expect("the ribbon was painted");
+        let near = first_painted_along(&shapes, &near).expect("a wall was painted");
+        let far = first_painted_along(&shapes, &far).expect("the other wall was painted");
+
+        // Back to front, as the viewer added them.
+        assert!(ribbon < near && near < far);
+
+        let what = format!("style {style_layer:?}, wire {own_layer:?}");
+        match own_layer.unwrap_or(style_layer) {
+            WireLayer::BehindNodes => assert!(far < node, "{what}"),
+            WireLayer::AboveNodes => assert!(ribbon > node, "{what}"),
+        }
     }
 }
 

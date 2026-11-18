@@ -82,6 +82,27 @@ overrides `wire_action` or gives the wire a menu.
   `WirePaint::hidden().with_hit_width(w)` and draw from `MeasuredWire::geometry` in
   `measured`; hover, selection, actions and anchors still follow that path.
 
+### Wires that are tubes
+
+For a wire with a width that varies along it, or with something of the viewer's own
+painted on it. None of this is used unless a viewer calls it.
+
+- `CableGeometry::with_radii(|share| half_width)` turns a path into a tube. Return it
+  from `wire_route`. The view then picks the wire anywhere between its walls, culls it by
+  the bounds of the walls, and hands the same tube to `wire_paint`.
+- `CableGeometry::subdivided(spacing)` gives a straight or coarsely sampled path enough
+  points for a profile; `offset(|share| distance)` moves a path sideways, for a route that
+  bends between fixed ends; `section(from, to)` cuts out a stretch.
+- `CableGeometry::walls()` are the two edges and `ribbon(|share| colour)` is the area
+  between them as one mesh with a colour per point, for contents painted as a connected
+  band.
+- `WirePaint::under_shape(shape)` / `over_shape(shape)` paint any `egui::Shape`, in graph
+  coordinates, with the wire: in its layer, inside the clip of the view, behind and in
+  front of its strokes and beads.
+- `wire_route` is asked on every pass, so a tube may change from frame to frame; the pass
+  that paints a shape is the pass that picks along it. Ask for the next frame yourself
+  (`Context::request_repaint`) while something moves.
+
 ### Replacing a tube overlay painted over the canvas
 
 `tube.rs` is `paint_energy` from `renderlab-native` (`crates/renderlab-dx12/src/paint_graph.rs`

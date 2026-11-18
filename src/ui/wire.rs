@@ -828,10 +828,17 @@ pub struct WireBead {
 /// The path is the same [`CableGeometry`] the wire is hit tested with, so a wire drawn as a
 /// wide glowing tube is still picked along exactly the curve the eye sees.
 /// Colours and widths carry no meaning to the graph view; the viewer decides what they stand for.
+///
+/// A viewer that needs more than strokes and discs adds shapes of its own with
+/// [`WirePaint::under_shape`] and [`WirePaint::over_shape`]. They are painted with the wire:
+/// in its layer, inside the clip of the view, in graph coordinates, behind and in front of
+/// its strokes and discs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WirePaint {
+    shapes_under: Vec<Shape>,
     strokes: SmallVec<[Stroke; 4]>,
     beads: SmallVec<[WireBead; 4]>,
+    shapes_over: Vec<Shape>,
     hit_width: f32,
     layer: Option<WireLayer>,
 }
@@ -842,8 +849,10 @@ impl WirePaint {
     pub fn solid(stroke: impl Into<Stroke>) -> Self {
         let stroke = stroke.into();
         Self {
+            shapes_under: Vec::new(),
             strokes: smallvec::smallvec![stroke],
             beads: SmallVec::new(),
+            shapes_over: Vec::new(),
             hit_width: stroke.width,
             layer: None,
         }
@@ -856,8 +865,10 @@ impl WirePaint {
     #[must_use]
     pub fn hidden() -> Self {
         Self {
+            shapes_under: Vec::new(),
             strokes: SmallVec::new(),
             beads: SmallVec::new(),
+            shapes_over: Vec::new(),
             hit_width: 0.0,
             layer: None,
         }
@@ -914,10 +925,32 @@ impl WirePaint {
         self
     }
 
+    /// Adds a shape behind the wire's strokes and discs, and behind the shapes added this
+    /// way before it.
+    ///
+    /// The shape is in graph coordinates, as the wire's path is. Build it from the path the
+    /// view hands to [`SnarlViewer::wire_paint`](super::SnarlViewer::wire_paint), for example
+    /// with [`CableGeometry::ribbon`] or [`CableGeometry::walls`], and it is painted where
+    /// the wire is picked.
+    #[must_use]
+    pub fn under_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_under.insert(0, shape.into());
+        self
+    }
+
+    /// Adds a shape in front of the wire's strokes and discs, and in front of the shapes
+    /// added this way before it. See [`WirePaint::under_shape`].
+    #[must_use]
+    pub fn over_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_over.push(shape.into());
+        self
+    }
+
     /// Sets the width of the band in which the pointer counts as being on the wire.
     ///
     /// Defaults to the width of the stroke given to [`WirePaint::solid`]. A glow does not widen it,
-    /// and neither does a bead.
+    /// and neither does a bead or a shape. A path with half widths is picked between its
+    /// walls whatever this width is.
     /// The view never picks more narrowly than [`SnarlStyle::wire_hit_tolerance`](super::SnarlStyle::wire_hit_tolerance).
     #[must_use]
     pub const fn with_hit_width(mut self, width: f32) -> Self {
@@ -947,6 +980,20 @@ impl WirePaint {
     #[inline]
     pub fn beads(&self) -> &[WireBead] {
         &self.beads
+    }
+
+    /// Shapes painted behind the wire's strokes, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_under(&self) -> &[Shape] {
+        &self.shapes_under
+    }
+
+    /// Shapes painted in front of the wire's discs, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_over(&self) -> &[Shape] {
+        &self.shapes_over
     }
 
     /// Width of the band in which the pointer counts as being on the wire.
@@ -987,14 +1034,21 @@ impl WirePaint {
             .map(|bead| bead.radius)
             .fold(self.widest() * 0.5, f32::max);
 
-        if !geometry.bounds().expand(reach).intersects(clip_rect) {
+        let mut covered = geometry.bounds().expand(reach);
+        for shape in self.shapes_under.iter().chain(&self.shapes_over) {
+            covered |= shape.visual_bounding_rect();
+        }
+
+        if !covered.intersects(clip_rect) {
             return;
         }
 
+        shapes.extend(self.shapes_under.iter().cloned());
         shapes.extend(strokes.map(|&stroke| geometry.stroke(stroke)));
         shapes.extend(beads.map(|bead| {
             Shape::circle_filled(geometry.anchor_at(bead.share).pos, bead.radius, bead.fill)
         }));
+        shapes.extend(self.shapes_over.iter().cloned());
     }
 }
 
@@ -1110,6 +1164,58 @@ mod tests {
         for &point in cable.points() {
             assert!(cable.hit(point, 0.0).is_some());
         }
+    }
+
+    #[test]
+    fn shapes_of_the_viewer_are_painted_around_the_strokes_and_count_for_culling() {
+        let cable = route(WireStyle::Line).default_route();
+        let mark = |x: f32, color| Shape::circle_filled(pos2(x, 500.0), 4.0, color);
+
+        let paint = WirePaint::solid((3.0, Color32::WHITE))
+            .with_bead(0.5, 4.0, Color32::GREEN)
+            .under_shape(mark(1.0, Color32::RED))
+            .over_shape(mark(2.0, Color32::RED))
+            .under_shape(mark(3.0, Color32::RED))
+            .over_shape(mark(4.0, Color32::RED));
+
+        assert_eq!(paint.shapes_under().len(), 2);
+        assert_eq!(paint.shapes_over().len(), 2);
+        assert_eq!(paint.hit_width().to_bits(), 3.0f32.to_bits());
+
+        let mut shapes = Vec::new();
+        paint.paint(&cable, Rect::EVERYTHING, &mut shapes);
+
+        let order: Vec<f32> = shapes
+            .iter()
+            .map(|shape| match shape {
+                Shape::Circle(circle) if circle.fill == Color32::RED => circle.center.x,
+                Shape::Circle(_) => -1.0,
+                _ => 0.0,
+            })
+            .collect();
+        // The shape put under last, the one before it, the stroke, the bead, then the
+        // shapes put over in the order they were given.
+        assert_eq!(order, [3.0, 1.0, 0.0, -1.0, 2.0, 4.0]);
+
+        // A view that shows only where the shapes are still gets the wire painted.
+        let around_marks = Rect::from_center_size(pos2(2.0, 500.0), vec2(4.0, 4.0));
+        assert!(!cable.bounds().expand(10.0).intersects(around_marks));
+        shapes.clear();
+        paint.paint(&cable, around_marks, &mut shapes);
+        assert_eq!(shapes.len(), 6);
+
+        // A view that shows neither gets nothing.
+        shapes.clear();
+        paint.paint(
+            &cable,
+            Rect::from_center_size(pos2(-900.0, -900.0), vec2(10.0, 10.0)),
+            &mut shapes,
+        );
+        assert!(shapes.is_empty());
+
+        // Nothing is painted for a wire that was given no shape.
+        assert!(WirePaint::hidden().shapes_under().is_empty());
+        assert!(WirePaint::hidden().shapes_over().is_empty());
     }
 
     #[test]
