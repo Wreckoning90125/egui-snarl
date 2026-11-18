@@ -42,10 +42,11 @@ pub struct Node {
 /// Five sources on the left, five sinks on the right, a wire between each pair.
 pub fn seed() -> Snarl<Node> {
     // Sinks sit a little above or below their source, so that every wire has a bend.
-    const RISE: [f32; 5] = [-26.0, 24.0, -20.0, 26.0, 0.0];
+    const RISE: [f32; 5] = [-24.0, 20.0, -16.0, 24.0, 0.0];
 
+    // Far enough apart that a sink that sits low clears the one below it that sits high.
     // The last pipe bows upward at rest and is given the room to.
-    const ROWS: [f32; 5] = [0.0, 104.0, 208.0, 312.0, 520.0];
+    const ROWS: [f32; 5] = [0.0, 116.0, 232.0, 348.0, 560.0];
 
     let mut snarl = Snarl::new();
 

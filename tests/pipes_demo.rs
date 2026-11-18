@@ -787,6 +787,20 @@ fn every_pipe_is_drawn_between_the_walls_it_is_picked_between_as_it_moves() {
         Mechanism::ALL
     );
 
+    // The graph starts with every node clear of the others.
+    let nodes = world.anatomy().nodes.clone();
+    assert_eq!(nodes.len(), 10);
+    for (index, node) in nodes.iter().enumerate() {
+        for other in &nodes[index + 1..] {
+            assert!(
+                !node.screen_rect.intersects(other.screen_rect),
+                "{:?} lies over {:?}",
+                node.screen_rect,
+                other.screen_rect
+            );
+        }
+    }
+
     let mut widths: Vec<Vec<f32>> = vec![Vec::new(); wires.len()];
     let mut middles: Vec<Vec<Pos2>> = vec![Vec::new(); wires.len()];
 
