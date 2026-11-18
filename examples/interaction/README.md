@@ -2,7 +2,8 @@
 
 A graph that exercises measured pins, single-path wires, wire actions, a graph view inside
 a node and a searchable insert menu. `graph.rs` holds the saved state, the viewer and the
-view; `main.rs` holds the window; `fixture.json` is the state it starts from.
+view; `tube.rs` holds a wire look that a product used to paint in an overlay; `main.rs`
+holds the window; `fixture.json` is the state it starts from.
 
 ```sh
 cargo run --example interaction --features serde                      # 1440x900
@@ -49,34 +50,67 @@ width and glow are whatever the viewer returns.
 - The view builds one `CableGeometry` per wire and uses it for painting, hit testing,
   bounds, and midpoint and tangent anchors. Supply your own from
   `SnarlViewer::wire_route(&WireRoute, ..)`; it must start at `route.from` and end at
-  `route.to`, the measured pin centres.
+  `route.to`, the measured pin centres. The request is in graph coordinates;
+  `WireRoute::scale` is the zoom, for a route that keeps a length the same on screen.
 - `SnarlStyle::wire_slack` hangs the middle of the wire, `wire_sway` lets it lag behind
   a moving pin (bounded, deterministic, off when egui's `animation_time` is zero),
   `wire_hit_tolerance` is the pick distance in screen points at every zoom.
 - `SnarlViewer::wire_paint(&WireView, default, ..) -> WirePaint` themes each wire:
   `WirePaint::solid(core).under(casing).with_glow(color, spread).over(highlight)`.
-  `WireView` says which wire, whether it is hovered or selected, its pin colour and the
-  zoom. `with_hit_width` widens the pick band for a wide tube.
+  `WireView` says which wire, whether it is hovered or selected, its pin colour, its path
+  and the zoom. Widths are in graph units; divide by `WireView::scale` for a width on screen.
+- `WirePaint::with_bead(share, radius, fill)` puts a disc on the same path, for a pulse or
+  a marker. `with_layer(WireLayer::AboveNodes)` paints one wire above the nodes while the
+  style decides for the rest. `with_hit_width` sets the pick band for a wide tube.
+- To keep a painter of your own (a mesh, a shader), return
+  `WirePaint::hidden().with_hit_width(w)` and draw from `MeasuredWire::geometry` in
+  `measured`; hover, selection, actions and anchors still follow that path.
 
-Replacing an overlay that repaints glowing tubes over the view's own wires:
+### Replacing a tube overlay painted over the canvas
 
-```diff
- impl SnarlViewer<Node> for Viewer {
-+    fn wire_paint(&mut self, wire: &WireView<'_>, default: WirePaint, snarl: &Snarl<Node>) -> WirePaint {
-+        let Some(pins) = wire.pins else { return default };       // a wire being dragged
-+        let (color, width, glow) = self.look_of(pins, snarl);      // product-owned
-+        WirePaint::solid(Stroke::new(width, color))
-+            .with_glow(color, if wire.hovered { glow * 1.5 } else { glow })
-+            .with_hit_width(width + glow)
-+    }
- }
--// after the graph is shown: look pins up on the canvas and paint tubes on top
--paint_overlay(ui, &canvas_pins, &wires);
-```
+`tube.rs` is `paint_energy` from `renderlab-native` (`crates/renderlab-dx12/src/paint_graph.rs`
+at `13e1e70`) given through the hooks. Tick Pulses in the example to see it.
+`tests/interaction_demo.rs` carries that function's body and checks, at six zoom levels
+and seven moments each, in the top-level view and in the view inside the group, that the
+view paints what the overlay would have: the same four strokes and three discs, in the
+same order, to within a fiftieth of a point.
 
-To keep a painter of your own (a mesh, a shader), return
-`WirePaint::hidden().with_hit_width(w)` and draw from `MeasuredWire::geometry` in
-`measured`; hover, selection, actions and anchors still follow that path.
+| `paint_energy` | Through the hooks |
+| --- | --- |
+| Cubic between the measured pin centres, reach at least 24 points, flattened to half a point | `wire_route`; both lengths divided by `WireRoute::scale` |
+| Width `8 * zoom.clamp(0.6, 1.5)` in screen points | `wire_paint`; that width divided by `WireView::scale` |
+| Four strokes, widest first | `WirePaint::hidden().over(stroke)` four times |
+| Three discs hopping from point to point of the curve | `with_bead(wire.geometry.closest(point).share, ..)` |
+| A painter in `Order::Foreground`, clipped to the canvas | `with_layer(WireLayer::AboveNodes)`; the view clips its wires |
+| Only edges into a `Target` that has a colour | The viewer returns `default` for every other wire |
+| `ui.input(|input| input.time)` | The viewer keeps the time of the pass |
+
+What a product changes, in this order:
+
+1. The wrapper that owns the viewer and the mapping from its document to `WirePins`
+   takes a per-edge look from the product (a closure or a trait object: edge, zoom and
+   time in, route and paint out) and calls it from its `wire_route` and `wire_paint`.
+   A drawer title is one more value it takes from the product.
+2. The product builds that look from its own colour lookup and the numbers above, as
+   `tube.rs` does, then removes the `paint_energy` call and the function.
+
+What then differs on screen from the overlay, by design:
+
+- The canvas no longer paints a wire of its own under the tube. Where its route differed
+  from the overlay's curve there were two curves; there is now one.
+- The tube ends on the pins the edge is attached to. The overlay always used output 0 and
+  input 0.
+- The tube is in the canvas layer, above the nodes. An open menu, a tooltip or a window
+  over the canvas now covers it; the overlay painted over them.
+- Where two tubes cross, they stack in pin order, not in document order.
+- The view rounds its viewport to a thirty-second of a graph unit, so the clip rectangle
+  can sit that far from the canvas rectangle.
+- The tube can be hovered, selected and given a menu, along the curve that is painted.
+  A node it passes over still takes the pointer.
+
+Not checked here: the product's colour lookup and its function that turns a colour and an
+opacity into a paint colour, for which `tube.rs` has stand-ins; the wrapper's types; and
+any build of the product.
 
 ### Wire actions that leave reconnecting alone
 
