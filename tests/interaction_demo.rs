@@ -31,10 +31,11 @@ fn group(document: &Document) -> (NodeId, &Snarl<Block>) {
 }
 
 fn show(ctx: &Context, document: &mut Document, viewer: &mut Viewer, passes: usize) {
-    for pass in 0..passes {
+    for _ in 0..passes {
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
-            time: Some(pass as f64 / 60.0),
+            time: Some(ctx.input(|input| input.time) + 1.0 / 60.0),
+            predicted_dt: 1.0 / 60.0,
             ..RawInput::default()
         };
 
@@ -117,6 +118,24 @@ fn the_fixture_is_measured_as_saved_and_comes_back_the_same() {
     }
     assert_eq!(endpoints(&document.graph), saved_wires);
     assert_eq!(endpoints(group(&document).1), saved_inner_wires);
+
+    // Opened again and asked to frame its nodes, the view inside the group shows all of
+    // them, although the group was still opening when it was asked.
+    document.graph.open_node(group_node, true);
+    viewer.fit();
+    show(&ctx, &mut document, &mut viewer, 90);
+
+    let reopened = get_snarl_anatomy(graph::embedded_view_id(group_node), &ctx).unwrap();
+    assert_eq!(reopened.nodes.len(), 4);
+    for node in &reopened.nodes {
+        assert!(
+            reopened.transform.viewport.contains_rect(node.final_rect),
+            "{:?} at {:?} is inside {:?}",
+            node.id,
+            node.final_rect,
+            reopened.transform.viewport
+        );
+    }
 
     // What is saved after all that reads back with the same wires and the same nodes.
     let restored = Document::from_json(&document.to_json()).unwrap();

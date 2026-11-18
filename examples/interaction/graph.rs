@@ -852,6 +852,16 @@ impl SnarlViewer<Block> for Viewer {
     }
 
     fn measured(&mut self, anatomy: &SnarlAnatomy, ui: &mut Ui, _snarl: &mut Snarl<Block>) {
+        // A view can only be framed once its nodes hold still. While one is opening, closing
+        // or still being measured, keep the request for a few more passes.
+        let settling = anatomy
+            .nodes
+            .iter()
+            .any(|node| node.remeasured || (node.openness > 0.0 && node.openness < 1.0));
+        if self.fit_passes > 0 && settling {
+            self.fit_passes = self.fit_passes.max(3);
+        }
+
         // Mark the point an open menu inserts at. It is drawn in graph coordinates, so it
         // shows that the point holds still while the popup is moved about the screen.
         if let Some(anchor) = anatomy.active_insertion_anchor {
