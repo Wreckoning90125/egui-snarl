@@ -214,14 +214,14 @@ impl Document {
             },
         );
         let inner_shape = inner.insert_node(
-            pos2(170.0, 20.0),
+            pos2(260.0, 20.0),
             Block::Shaper {
                 name: "Fold".to_owned(),
                 amount: 0.5,
             },
         );
         let inner_out = inner.insert_node(
-            pos2(360.0, 30.0),
+            pos2(450.0, 30.0),
             Block::Sink {
                 name: "port: out".to_owned(),
             },
