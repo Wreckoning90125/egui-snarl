@@ -96,23 +96,25 @@ impl InteractionApp {
 
         ui.checkbox(&mut settings.glow, "Glow")
             .on_hover_text("Paint each wire as a tube with a halo, along the path it is hit on");
+        // The sliders round what they show, not what is saved: a slider told to keep two
+        // decimals would write the rounded number back into the settings on every pass.
         ui.add(
             egui::Slider::new(&mut settings.slack, 0.0..=0.4)
                 .text("slack")
-                .fixed_decimals(2),
+                .custom_formatter(|value, _| format!("{value:.2}")),
         );
         ui.add_enabled(
             !settings.reduced_motion,
             egui::Slider::new(&mut settings.sway, 0.0..=1.0)
                 .text("sway")
-                .fixed_decimals(2),
+                .custom_formatter(|value, _| format!("{value:.2}")),
         );
         ui.checkbox(&mut settings.reduced_motion, "Reduced motion")
             .on_hover_text("Wires hold still and nodes open and close at once");
         ui.add(
             egui::Slider::new(&mut settings.hit_tolerance, 2.0..=24.0)
                 .text("hit")
-                .fixed_decimals(0),
+                .custom_formatter(|value, _| format!("{value:.0}")),
         )
         .on_hover_text("How far from a wire the pointer still counts as on it, in screen points");
 
