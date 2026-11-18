@@ -560,6 +560,25 @@ impl CableGeometry {
     #[must_use]
     pub fn offset(&self, mut distance: impl FnMut(f32) -> f32) -> Vec<Pos2> {
         let total = self.length();
+        let sides = self.sides();
+
+        self.points
+            .iter()
+            .zip(&self.lengths)
+            .zip(sides)
+            .map(|((&point, &length), side)| {
+                let share = if total > 0.0 { length / total } else { 0.0 };
+                let distance = distance(share);
+                let distance = if distance.is_finite() { distance } else { 0.0 };
+
+                point + side * distance
+            })
+            .collect()
+    }
+
+    /// For each point of the cable, the step that moves it one unit sideways: along the
+    /// normal there, longer at a bend so that the moved point sits on the mitre.
+    fn sides(&self) -> Vec<Vec2> {
         let last = self.points.len() - 1;
 
         (0..=last)
@@ -585,15 +604,7 @@ impl CableGeometry {
                     (None, None) => (Vec2::X, 1.0),
                 };
 
-                let share = if total > 0.0 {
-                    self.lengths[index] / total
-                } else {
-                    0.0
-                };
-                let distance = distance(share);
-                let distance = if distance.is_finite() { distance } else { 0.0 };
-
-                self.points[index] + vec2(-tangent.y, tangent.x) * (distance * mitre)
+                vec2(-tangent.y, tangent.x) * mitre
             })
             .collect()
     }
@@ -627,22 +638,41 @@ impl CableGeometry {
             return Shape::Noop;
         }
 
-        let [near, far] = self.walls();
+        self.band(|share| {
+            let (radius, color) = (self.radius_at(share), fill(share));
+            [(-radius, color), (radius, color)]
+        })
+    }
+
+    /// A band along the cable between two lines beside it, as one shape.
+    ///
+    /// `edges` gives, at each share of the arc length, the two edges of the band there:
+    /// how far each lies from the cable, as [`CableGeometry::offset`] counts it, and its
+    /// colour. Colours are blended across the band as well as along it. Several bands
+    /// side by side shade a tube across its width; one that is narrower than the tube is
+    /// a highlight or a stripe on it.
+    ///
+    /// The cable needs no half widths for this. The edges are not softened.
+    #[must_use]
+    pub fn band(&self, mut edges: impl FnMut(f32) -> [(f32, Color32); 2]) -> Shape {
         let total = self.length();
+        let sides = self.sides();
 
         let mut mesh = Mesh::default();
         mesh.reserve_vertices(2 * self.points.len());
         mesh.reserve_triangles(2 * (self.points.len() - 1));
 
-        for (index, (&near, &far)) in near.iter().zip(&far).enumerate() {
+        for (index, (&point, side)) in self.points.iter().zip(sides).enumerate() {
             let share = if total > 0.0 {
                 self.lengths[index] / total
             } else {
                 0.0
             };
-            let color = fill(share);
-            mesh.colored_vertex(near, color);
-            mesh.colored_vertex(far, color);
+
+            for (distance, color) in edges(share) {
+                let distance = if distance.is_finite() { distance } else { 0.0 };
+                mesh.colored_vertex(point + side * distance, color);
+            }
 
             if index > 0 {
                 #[allow(clippy::cast_possible_truncation)]
@@ -1109,6 +1139,50 @@ mod tests {
             elbow().with_radii(|_| 0.0).ribbon(|_| Color32::WHITE),
             Shape::Noop
         );
+    }
+
+    #[test]
+    fn a_band_lies_between_two_lines_beside_the_cable_with_a_colour_at_each() {
+        let (inner, outer) = (Color32::from_gray(200), Color32::from_gray(40));
+
+        // A band over half the width of a tube, lighter toward the middle.
+        let tube = bulged();
+        let Shape::Mesh(mesh) =
+            tube.band(|share| [(0.0, inner), (0.5 * tube.radius_at(share), outer)])
+        else {
+            panic!("a band is a mesh");
+        };
+
+        assert!(mesh.is_valid());
+        assert_eq!(mesh.vertices.len(), 2 * tube.points().len());
+        assert_eq!(mesh.indices.len(), 6 * (tube.points().len() - 1));
+
+        let half_way = tube.offset(|share| 0.5 * tube.radius_at(share));
+        for (index, pair) in mesh.vertices.chunks(2).enumerate() {
+            assert_eq!(pair[0].pos, tube.points()[index]);
+            assert_eq!(pair[1].pos, half_way[index]);
+            assert_eq!((pair[0].color, pair[1].color), (inner, outer));
+        }
+
+        // A cable needs no half widths to carry a band, and at a bend both edges sit on
+        // the mitre.
+        let Shape::Mesh(mesh) = elbow().band(|_| [(-2.0, inner), (3.0, outer)]) else {
+            panic!("a band is a mesh");
+        };
+        let (near, far) = (elbow().offset(|_| -2.0), elbow().offset(|_| 3.0));
+        for (index, pair) in mesh.vertices.chunks(2).enumerate() {
+            assert_eq!((pair[0].pos, pair[1].pos), (near[index], far[index]));
+        }
+
+        // A distance that is not a number is none.
+        let Shape::Mesh(mesh) = elbow().band(|_| [(f32::NAN, inner), (f32::INFINITY, outer)])
+        else {
+            panic!("a band is a mesh");
+        };
+        for (index, pair) in mesh.vertices.chunks(2).enumerate() {
+            assert_eq!(pair[0].pos, elbow().points()[index]);
+            assert_eq!(pair[1].pos, elbow().points()[index]);
+        }
     }
 
     #[test]

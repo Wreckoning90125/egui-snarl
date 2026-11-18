@@ -96,6 +96,9 @@ painted on it. None of this is used unless a viewer calls it.
 - `CableGeometry::walls()` are the two edges and `ribbon(|share| colour)` is the area
   between them as one mesh with a colour per point, for contents painted as a connected
   band.
+- `CableGeometry::band(|share| [(distance, colour); 2])` is a band between any two lines
+  beside the path, with a colour at each edge, blended across the band as well as along
+  it. Bands side by side shade a tube across its width; a narrow one is a highlight.
 - `WirePaint::under_shape(shape)` / `over_shape(shape)` paint any `egui::Shape`, in graph
   coordinates, with the wire: in its layer, inside the clip of the view, behind and in
   front of its strokes and beads.
