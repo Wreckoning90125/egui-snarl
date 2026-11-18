@@ -333,6 +333,10 @@ impl Document {
                 self.settings.sway
             }),
             wire_hit_tolerance: Some(self.settings.hit_tolerance),
+            wire_picking: Some(true),
+            nodes_cover_wires: Some(true),
+            wire_smoothness_on_screen: Some(true),
+            output_rows_clear_pins: Some(true),
             pin_size: Some(12.0),
             ..SnarlStyle::new()
         }
@@ -652,6 +656,10 @@ impl SnarlViewer<Block> for Viewer {
             wire_width: Some(2.5),
             wire_slack: Some(self.settings.slack),
             wire_hit_tolerance: Some(self.settings.hit_tolerance),
+            wire_picking: Some(true),
+            nodes_cover_wires: Some(true),
+            wire_smoothness_on_screen: Some(true),
+            output_rows_clear_pins: Some(true),
             pin_size: Some(12.0),
             min_scale: Some(0.25),
             ..SnarlStyle::new()

@@ -25,6 +25,22 @@ cargo run --example interaction --features serde -- --write-fixture examples/int
 Everything below is in `egui_snarl::ui`. Nothing in it knows what a wire carries; colour,
 width and glow are whatever the viewer returns.
 
+### Nothing changes until a graph asks
+
+A viewer that overrides none of the wire hooks and a style that sets none of the fields
+below gets the graph it had before: the same shapes, the same callbacks, the same keys
+left alone. `tests/plain_graph.rs` checks each of these off and on.
+
+| `SnarlStyle` field | Off, the default | On |
+| --- | --- | --- |
+| `wire_picking` | A click, a double click or a tap on a wire does nothing; no key is taken; a touch held on a wire belongs to the canvas | They select the wire; Delete, Backspace, Enter, Space and Escape act on the selected wire; a held touch is reported for the wire |
+| `nodes_cover_wires` | A wire is hovered and acted on along its whole path, also under a node | A node takes the pointer from the wires it covers |
+| `wire_smoothness_on_screen` | `wire_smoothness` is a distance in graph units at every zoom | It is divided by the zoom in a magnified view |
+| `output_rows_clear_pins` | With pins inside the node, what an output row shows can run under its pin | The row's content ends where the pin starts |
+
+A secondary click on a wire disconnects it either way, as it always has, unless the viewer
+overrides `wire_action` or gives the wire a menu.
+
 ### Stable identity
 
 - Give every view an explicit id: `SnarlWidget::new().id(id)`. Pins, nodes, wires and
@@ -105,8 +121,9 @@ What then differs on screen from the overlay, by design:
 - Where two tubes cross, they stack in pin order, not in document order.
 - The view rounds its viewport to a thirty-second of a graph unit, so the clip rectangle
   can sit that far from the canvas rectangle.
-- The tube can be hovered, selected and given a menu, along the curve that is painted.
-  A node it passes over still takes the pointer.
+- The tube can be hovered and given a menu along the curve that is painted, and selected
+  where the style turns `wire_picking` on. A node it passes over takes the pointer where
+  the style turns `nodes_cover_wires` on.
 
 Not checked here: the product's colour lookup and its function that turns a colour and an
 opacity into a paint colour, for which `tube.rs` has stand-ins; the wrapper's types; and
@@ -114,10 +131,13 @@ any build of the product.
 
 ### Wire actions that leave reconnecting alone
 
-- `SnarlViewer::wire_action(&WireAction, ..)` reports `Click` (the view has selected the
-  wire), `DoubleClick`, `SecondaryClick`, `LongTouch`, and `Delete` / `Activate` from the
-  keyboard for the selected wire, with the point on the wire and an `InsertionAnchor`.
-  Unless overridden, `SecondaryClick` and `Delete` disconnect, as a right-click did before.
+- `SnarlViewer::wire_action(&WireAction, ..)` reports `Click`, `DoubleClick`,
+  `SecondaryClick`, `LongTouch`, and `Delete` / `Activate` from the keyboard for the
+  selected wire, with the point on the wire and an `InsertionAnchor`. Unless overridden,
+  `SecondaryClick` and `Delete` disconnect, as a right-click did before.
+- With `SnarlStyle::wire_picking` on, the view selects the wire on `Click` and takes the
+  keys while a wire is selected. With it off, the view selects nothing on its own and
+  takes no key; `LongTouch` is reported only for a wire that has a menu.
 - `has_wire_menu` / `show_wire_menu` host a product-owned menu at that point.
   `has_wire_widget` / `show_wire_widget` put a widget on the wire's midpoint.
 - Dragging from a pin, dragging a node and panning never reach these hooks.
@@ -150,11 +170,9 @@ any build of the product.
 - `SnarlViewer::current_transform` receives the view's transform relative to the layer
   it is shown in. For a top-level view that is what it received before.
 - `has_wire_widget` / `show_wire_widget` are now called.
-- An output row's content no longer runs under its pin, so output rows are wider by up
-  to the pin size.
-- `wire_smoothness` is divided by the zoom in a magnified view.
-- Wires react to the pointer only where the canvas itself is under it, not through a node.
-- Keys act on the selected wire only; select one by click, tap or `set_selected_wire`.
+- Wires are painted in pin order. Before, the order changed from run to run.
+- A wire whose paint is fully transparent and has no width is not painted at all.
+- `set_selected_wire` selects a wire whatever the style says; keys then act on it.
 - A view inside a node paints above every node of its host view, including a node
   dragged over the host node.
 

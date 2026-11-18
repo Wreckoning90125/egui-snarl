@@ -566,6 +566,55 @@ pub struct SnarlStyle {
     )]
     pub wire_smoothness: Option<f32>,
 
+    /// Whether a magnified view samples wires more finely, so that a curve is as smooth on
+    /// screen at every zoom as it is at natural size. Off by default.
+    ///
+    /// When off, [`SnarlStyle::wire_smoothness`] is a distance in graph units at every zoom.
+    /// When on, it is divided by the zoom wherever the view is magnified.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub wire_smoothness_on_screen: Option<bool>,
+
+    /// Whether a node takes the pointer from the wires it covers. Off by default.
+    ///
+    /// When off, a wire is hovered and acted on wherever the pointer is on its path, also
+    /// where a node lies over it. When on, the pointer reaches a wire only where no node is
+    /// under it, whichever of the two is painted on top.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub nodes_cover_wires: Option<bool>,
+
+    /// Whether what an output row shows stops short of its pin. Off by default.
+    ///
+    /// It matters where pins are placed inside the node. When off, the row gives up only the
+    /// item spacing on the pin's side, and content as wide as the row runs under the pin.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub output_rows_clear_pins: Option<bool>,
+
+    /// Whether wires can be picked with the primary button and by touch. Off by default.
+    ///
+    /// When on, a click, a double click or a tap on a wire selects it, and a touch held on it
+    /// is reported for the wire. A selected wire is painted as selected and reported as such
+    /// to [`SnarlViewer::wire_paint`]. While it is selected, Delete, Backspace, Enter and
+    /// Space are taken from the keyboard and reported to [`SnarlViewer::wire_action`], and
+    /// Escape drops the selection.
+    ///
+    /// When off, the view selects no wire on its own and takes no key, and a touch held on a
+    /// wire belongs to the canvas unless the wire has a menu. A wire selected with
+    /// [`set_selected_wire`] is selected either way.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub wire_picking: Option<bool>,
+
     /// How far the middle of a wire hangs below its taut path, as a share of the distance
     /// between its pins. `0.0`, the default, keeps wires taut.
     ///
@@ -747,6 +796,22 @@ impl SnarlStyle {
         self.wire_smoothness.unwrap_or(1.0)
     }
 
+    fn get_wire_smoothness_on_screen(&self) -> bool {
+        self.wire_smoothness_on_screen.unwrap_or(false)
+    }
+
+    fn get_nodes_cover_wires(&self) -> bool {
+        self.nodes_cover_wires.unwrap_or(false)
+    }
+
+    fn get_output_rows_clear_pins(&self) -> bool {
+        self.output_rows_clear_pins.unwrap_or(false)
+    }
+
+    fn get_wire_picking(&self) -> bool {
+        self.wire_picking.unwrap_or(false)
+    }
+
     fn get_wire_slack(&self) -> f32 {
         match self.wire_slack {
             Some(slack) if slack.is_finite() => slack.clamp(0.0, 1.0),
@@ -856,6 +921,10 @@ impl SnarlStyle {
             select_style: None,
             crisp_magnified_text: None,
             wire_smoothness: None,
+            wire_smoothness_on_screen: None,
+            nodes_cover_wires: None,
+            output_rows_clear_pins: None,
+            wire_picking: None,
             wire_slack: None,
             wire_sway: None,
             wire_hit_tolerance: None,
@@ -1304,9 +1373,15 @@ where
 
     let scale = to_global.scaling;
 
-    // Smoothness is given in graph units. A magnified view samples routes more finely, so
-    // that a wire is as smooth on screen as it is at natural size.
-    let wire_threshold = style.get_wire_smoothness() / scale.max(1.0);
+    // Smoothness is given in graph units. When the style asks for it, a magnified view samples
+    // routes more finely, so that a wire is as smooth on screen as it is at natural size.
+    let wire_threshold = if style.get_wire_smoothness_on_screen() {
+        style.get_wire_smoothness() / scale.max(1.0)
+    } else {
+        style.get_wire_smoothness()
+    };
+    let wire_picking = style.get_wire_picking();
+    let nodes_cover_wires = style.get_nodes_cover_wires();
     let select_stroke = style.get_select_stroke(ui.style());
     let upscale_wire_frame = style.get_upscale_wire_frame();
     let downscale_wire_frame = style.get_downscale_wire_frame();
@@ -1346,9 +1421,10 @@ where
             && !snarl_state.is_rect_selection()
             && (snarl_resp.contains_pointer() || canvas_clicked)
             && transform.viewport.contains(pos)
-            && !measured_nodes
-                .iter()
-                .any(|node| node.final_rect.contains(pos))
+            && !(nodes_cover_wires
+                && measured_nodes
+                    .iter()
+                    .any(|node| node.final_rect.contains(pos)))
     });
 
     let sways_id = snarl_id.with("wire-sways");
@@ -1495,13 +1571,32 @@ where
             snarl,
         );
 
-        let trigger = if snarl_resp.long_touched() {
+        // Unless nodes cover wires, a wire takes clicks wherever the pointer is on its path,
+        // as it always has: also where a node lies over it and would take them itself.
+        let over_nodes = (!nodes_cover_wires).then(|| {
+            ui.interact(
+                snarl_resp.rect,
+                ui.make_persistent_id(("wire", wire.pins)),
+                Sense::click(),
+            )
+        });
+        let clicked = |by: fn(&egui::Response) -> bool| {
+            by(&snarl_resp) || over_nodes.as_ref().is_some_and(by)
+        };
+
+        let long_touched = clicked(egui::Response::long_touched)
+            && (wire_picking || viewer.has_wire_menu(wire.pins, snarl));
+
+        let trigger = if long_touched {
             Some(WireTrigger::LongTouch)
-        } else if snarl_resp.clicked_by(PointerButton::Secondary) {
+        } else if clicked(egui::Response::long_touched) {
+            // The canvas keeps a held touch that the wire does not ask for.
+            None
+        } else if clicked(|response| response.clicked_by(PointerButton::Secondary)) {
             Some(WireTrigger::SecondaryClick)
-        } else if snarl_resp.double_clicked() {
+        } else if clicked(egui::Response::double_clicked) {
             Some(WireTrigger::DoubleClick)
-        } else if snarl_resp.clicked_by(PointerButton::Primary) {
+        } else if clicked(|response| response.clicked_by(PointerButton::Primary)) {
             Some(WireTrigger::Click)
         } else {
             None
@@ -1514,7 +1609,7 @@ where
                 .flags
                 .remove(Flags::CLICKED | Flags::LONG_TOUCHED);
 
-            if matches!(trigger, WireTrigger::Click | WireTrigger::DoubleClick) {
+            if wire_picking && matches!(trigger, WireTrigger::Click | WireTrigger::DoubleClick) {
                 snarl_state.select_wire(Some(wire.pins));
                 take_keyboard(ui.ctx(), snarl_id);
             }
@@ -2250,10 +2345,17 @@ where
         outputs_ui.scope_builder(builder, |pin_ui| {
             // Allocate space for pin shape.
             if let Some(output_spacing) = output_spacing {
-                // The row is laid out right to left, so the pin's space ends at the cursor.
-                let max = pin_ui.next_widget_position();
+                // The row is laid out right to left. Space that ends at the cursor keeps
+                // the content clear of the pin; space that starts there, as it always
+                // has, gives up only the item spacing.
+                let cursor = pin_ui.next_widget_position();
+                let left = if style.get_output_rows_clear_pins() {
+                    cursor.x - output_spacing
+                } else {
+                    cursor.x
+                };
                 pin_ui.advance_cursor_after_rect(Rect::from_min_size(
-                    pos2(max.x - output_spacing, max.y),
+                    pos2(left, cursor.y),
                     vec2(output_spacing, pin_size),
                 ));
             }

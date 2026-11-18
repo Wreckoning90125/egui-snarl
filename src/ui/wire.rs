@@ -578,23 +578,6 @@ fn wire_axis_aligned(corner_radius: f32, frame_size: f32, from: Pos2, to: Pos2) 
     }
 }
 
-fn turn_samples_number(radius: f32, threshold: f32) -> usize {
-    #![allow(clippy::cast_sign_loss)]
-    #![allow(clippy::cast_possible_truncation)]
-    #![allow(clippy::cast_precision_loss)]
-
-    if threshold / radius >= 1.0 {
-        return 2;
-    }
-
-    let a: f32 = (1.0 - threshold / radius).acos();
-    let samples = (std::f32::consts::PI / (4.0 * a) + 1.0)
-        .min(MAX_CURVE_SAMPLES as f32)
-        .ceil() as usize;
-
-    samples.clamp(2, MAX_CURVE_SAMPLES)
-}
-
 /// Very basic lower-bound algorithm
 /// Finds the smallest number in range [min, max) that satisfies the predicate
 /// If no such number exists, returns max
@@ -710,7 +693,7 @@ impl WireRoute {
             }
             WireStyle::AxisAligned { corner_radius } => {
                 let wire = wire_axis_aligned(corner_radius, frame_size, from, to);
-                CableGeometry::from_points(axis_aligned_line(&wire, tolerance))
+                CableGeometry::from_points(axis_aligned_line(&wire))
             }
         };
 
@@ -731,7 +714,7 @@ fn sampled_bezier(points: &[Pos2], samples: usize) -> impl Iterator<Item = Pos2>
     })
 }
 
-fn axis_aligned_line(wire: &AxisAlignedWire, threshold: f32) -> Vec<Pos2> {
+fn axis_aligned_line(wire: &AxisAlignedWire) -> Vec<Pos2> {
     let mut line = Vec::new();
 
     for i in 0..wire.turns {
@@ -740,7 +723,8 @@ fn axis_aligned_line(wire: &AxisAlignedWire, threshold: f32) -> Vec<Pos2> {
 
         if wire.turn_radii[i] > 0.0 {
             let turn = wire.turn_centers[i];
-            let samples = turn_samples_number(wire.turn_radii[i], threshold);
+            // Corners have always been drawn this finely, whatever smoothness was asked for.
+            let samples = MAX_CURVE_SAMPLES;
 
             let start = wire.segments[i].1;
             let end = wire.segments[i + 1].0;

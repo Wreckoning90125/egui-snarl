@@ -281,6 +281,11 @@ fn style() -> SnarlStyle {
     SnarlStyle {
         wire_width: Some(2.0),
         wire_hit_tolerance: Some(6.0),
+        // What these tests are about is off unless a style asks for it.
+        wire_picking: Some(true),
+        nodes_cover_wires: Some(true),
+        wire_smoothness_on_screen: Some(true),
+        output_rows_clear_pins: Some(true),
         // A double click must not move the view under the pointer in these tests.
         centering: Some(false),
         ..SnarlStyle::new()

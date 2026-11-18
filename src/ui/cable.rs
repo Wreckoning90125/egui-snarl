@@ -338,7 +338,10 @@ impl CableGeometry {
     /// The cable as a stroked shape.
     #[must_use]
     pub fn stroke(&self, stroke: impl Into<Stroke>) -> Shape {
-        Shape::line(self.points.clone(), stroke.into())
+        match self.points[..] {
+            [from, to] => Shape::line_segment([from, to], stroke.into()),
+            _ => Shape::line(self.points.clone(), stroke.into()),
+        }
     }
 }
 

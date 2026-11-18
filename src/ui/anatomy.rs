@@ -354,7 +354,8 @@ pub struct WireView<'a> {
 /// What was done to a wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WireTrigger {
-    /// Primary click or tap on the wire. The view has already selected it.
+    /// Primary click or tap on the wire. The view has already selected it when
+    /// [`SnarlStyle::wire_picking`](super::SnarlStyle::wire_picking) is on.
     Click,
 
     /// Primary double click or double tap on the wire.
@@ -363,7 +364,9 @@ pub enum WireTrigger {
     /// Secondary click on the wire.
     SecondaryClick,
 
-    /// Touch held on the wire.
+    /// Touch held on the wire. Reported when the wire has a menu or
+    /// [`SnarlStyle::wire_picking`](super::SnarlStyle::wire_picking) is on; otherwise the
+    /// touch belongs to the canvas.
     LongTouch,
 
     /// Delete or Backspace pressed while the wire is selected.
