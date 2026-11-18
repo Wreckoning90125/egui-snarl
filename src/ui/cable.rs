@@ -1,6 +1,6 @@
 //! One cable geometry shared by painting, hit testing, bounds and anchors.
 
-use egui::{Pos2, Rect, Shape, Stroke, Vec2, emath::TSTransform, vec2};
+use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, Vec2, emath::TSTransform, vec2};
 use smallvec::SmallVec;
 
 /// Upper bound on the segments a sag adds to one cable.
@@ -11,6 +11,12 @@ const MAX_BEZIER_SEGMENTS: usize = 100;
 
 /// Tolerance used when the caller supplies one that is not a positive finite number.
 const FALLBACK_TOLERANCE: f32 = 0.25;
+
+/// Upper bound on the points [`CableGeometry::subdivided`] gives one cable.
+const MAX_SUBDIVIDED_POINTS: usize = 1024;
+
+/// How much farther than its half width a wall may reach at a sharp bend.
+const MAX_MITRE: f32 = 2.0;
 
 /// A point on a cable together with the cable's direction there.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,10 +52,15 @@ pub struct CableHit {
 /// The same points are stroked, hit tested, bounded and measured, so a wire can never be
 /// painted along one curve and picked along another.
 /// Coordinates are whatever space the points were given in; the graph view uses graph space.
+///
+/// A cable can also carry a half width at each point, given with
+/// [`CableGeometry::with_radii`], for a wire that is a tube rather than a line. The walls,
+/// the filled ribbon, the bounds and the hit test then all follow that one profile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CableGeometry {
     points: Vec<Pos2>,
     lengths: Vec<f32>,
+    radii: Option<Vec<f32>>,
     bounds: Rect,
 }
 
@@ -60,17 +71,24 @@ impl CableGeometry {
     /// The result always holds at least two points, so a degenerate input gives a cable of zero length.
     #[must_use]
     pub fn from_points(points: impl IntoIterator<Item = Pos2>) -> Self {
-        let mut points: Vec<Pos2> = points
-            .into_iter()
-            .filter(|point| point.x.is_finite() && point.y.is_finite())
-            .collect();
-        points.dedup();
+        Self::from_parts(points.into_iter().map(|point| (point, 0.0)), false)
+    }
 
-        match points.len() {
-            0 => points = vec![Pos2::ZERO; 2],
-            1 => points.push(points[0]),
+    /// Builds a cable through points that each come with a half width, kept when `tube` is set.
+    fn from_parts(parts: impl IntoIterator<Item = (Pos2, f32)>, tube: bool) -> Self {
+        let mut parts: Vec<(Pos2, f32)> = parts
+            .into_iter()
+            .filter(|(point, _)| point.x.is_finite() && point.y.is_finite())
+            .collect();
+        parts.dedup_by(|next, kept| next.0 == kept.0);
+
+        match parts.len() {
+            0 => parts = vec![(Pos2::ZERO, 0.0); 2],
+            1 => parts.push(parts[0]),
             _ => {}
         }
+
+        let points: Vec<Pos2> = parts.iter().map(|&(point, _)| point).collect();
 
         let mut lengths = Vec::with_capacity(points.len());
         let mut total = 0.0;
@@ -80,11 +98,28 @@ impl CableGeometry {
             lengths.push(total);
         }
 
-        let bounds = Rect::from_points(&points);
+        let radii: Option<Vec<f32>> = tube.then(|| {
+            parts
+                .iter()
+                .map(|&(_, radius)| sane_radius(radius))
+                .collect()
+        });
+
+        let bounds = match &radii {
+            None => Rect::from_points(&points),
+            Some(radii) => {
+                let mut bounds = Rect::NOTHING;
+                for (&point, &radius) in points.iter().zip(radii) {
+                    bounds |= Rect::from_center_size(point, Vec2::splat(2.0 * radius));
+                }
+                bounds
+            }
+        };
 
         Self {
             points,
             lengths,
+            radii,
             bounds,
         }
     }
@@ -162,7 +197,7 @@ impl CableGeometry {
         let step = total / segments as f32;
 
         let mut points = Vec::with_capacity(self.points.len() + segments);
-        points.push(self.points[0]);
+        points.push((self.points[0], self.radius_of(0)));
 
         for index in 1..self.points.len() {
             let from = self.points[index - 1];
@@ -177,17 +212,115 @@ impl CableGeometry {
                 #[allow(clippy::cast_precision_loss)]
                 let t = piece as f32 / pieces as f32;
                 let share = (run.mul_add(t, from_length) / total).clamp(0.0, 1.0);
-                points.push(from.lerp(to, t) + sag * (4.0 * share * (1.0 - share)));
+                points.push((
+                    from.lerp(to, t) + sag * (4.0 * share * (1.0 - share)),
+                    egui::lerp(self.radius_of(index - 1)..=self.radius_of(index), t),
+                ));
             }
         }
 
-        Self::from_points(points)
+        Self::from_parts(points, self.radii.is_some())
     }
 
-    /// Returns this cable mapped through `transform`.
+    /// Returns this cable mapped through `transform`. Half widths scale with it.
     #[must_use]
     pub fn transformed(&self, transform: TSTransform) -> Self {
-        Self::from_points(self.points.iter().map(|&point| transform * point))
+        Self::from_parts(
+            self.points.iter().enumerate().map(|(index, &point)| {
+                (
+                    transform * point,
+                    self.radius_of(index) * transform.scaling.abs(),
+                )
+            }),
+            self.radii.is_some(),
+        )
+    }
+
+    /// Returns this cable as a tube whose half width at each point is `radius` of the share
+    /// of the arc length the point lies at.
+    ///
+    /// The half width runs straight from one point of the cable to the next, so a profile
+    /// finer than the cable's points needs [`CableGeometry::subdivided`] first. Half widths
+    /// that are negative or not finite count as zero.
+    #[must_use]
+    pub fn with_radii(self, mut radius: impl FnMut(f32) -> f32) -> Self {
+        let total = self.length();
+        let parts: Vec<(Pos2, f32)> = self
+            .points
+            .iter()
+            .zip(&self.lengths)
+            .map(|(&point, &length)| {
+                let share = if total > 0.0 { length / total } else { 0.0 };
+                (point, radius(share))
+            })
+            .collect();
+
+        Self::from_parts(parts, true)
+    }
+
+    /// Returns this cable with points added until none is farther than `spacing` from the
+    /// next. Every point it had is kept, so the path is the same.
+    ///
+    /// A straight wire is two points; this gives it enough for a half width or a displacement
+    /// that varies along it.
+    #[must_use]
+    pub fn subdivided(&self, spacing: f32) -> Self {
+        let total = self.length();
+        if !spacing.is_finite() || spacing <= 0.0 || total <= 0.0 {
+            return self.clone();
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let spacing = spacing.max(total / MAX_SUBDIVIDED_POINTS as f32);
+
+        let mut parts = Vec::with_capacity(self.points.len());
+        parts.push((self.points[0], self.radius_of(0)));
+
+        for index in 1..self.points.len() {
+            let run = self.lengths[index] - self.lengths[index - 1];
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pieces = ((run / spacing).ceil() as usize).clamp(1, MAX_SUBDIVIDED_POINTS);
+
+            for piece in 1..=pieces {
+                #[allow(clippy::cast_precision_loss)]
+                let t = piece as f32 / pieces as f32;
+                parts.push((
+                    self.points[index - 1].lerp(self.points[index], t),
+                    egui::lerp(self.radius_of(index - 1)..=self.radius_of(index), t),
+                ));
+            }
+        }
+
+        Self::from_parts(parts, self.radii.is_some())
+    }
+
+    /// The part of this cable between two shares of its arc length, with its half widths.
+    ///
+    /// Shares are clamped to `0.0..=1.0` and taken in ascending order.
+    #[must_use]
+    pub fn section(&self, from: f32, to: f32) -> Self {
+        let clamp = |share: f32| {
+            if share.is_finite() {
+                share.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        let (from, to) = (clamp(from).min(clamp(to)), clamp(from).max(clamp(to)));
+        let total = self.length();
+
+        let mut parts = Vec::new();
+        parts.push((self.anchor_at(from).pos, self.radius_at(from)));
+        for (index, &point) in self.points.iter().enumerate() {
+            let length = self.lengths[index];
+            if length > from * total && length < to * total {
+                parts.push((point, self.radius_of(index)));
+            }
+        }
+        parts.push((self.anchor_at(to).pos, self.radius_at(to)));
+
+        Self::from_parts(parts, self.radii.is_some())
     }
 
     /// The points of the cable, from its start to its end.
@@ -211,11 +344,60 @@ impl CableGeometry {
         self.points[self.points.len() - 1]
     }
 
-    /// Smallest rectangle holding every point of the cable.
+    /// Smallest rectangle holding every point of the cable, each with its half width around
+    /// it when the cable has them.
     #[must_use]
     #[inline]
     pub const fn bounds(&self) -> Rect {
         self.bounds
+    }
+
+    /// The half width at each of [`CableGeometry::points`], if the cable was given them.
+    #[must_use]
+    #[inline]
+    pub fn radii(&self) -> Option<&[f32]> {
+        self.radii.as_deref()
+    }
+
+    /// The half width `share` of the way along the cable's arc length. Zero for a cable that
+    /// was given none.
+    #[must_use]
+    pub fn radius_at(&self, share: f32) -> f32 {
+        if self.radii.is_none() {
+            return 0.0;
+        }
+
+        let (index, t) = self.locate(share);
+        egui::lerp(self.radius_of(index - 1)..=self.radius_of(index), t)
+    }
+
+    fn radius_of(&self, index: usize) -> f32 {
+        self.radii.as_ref().map_or(0.0, |radii| radii[index])
+    }
+
+    /// The segment that holds the point `share` of the way along the cable, as the index of
+    /// the point it ends at, and how far along that segment the point is.
+    fn locate(&self, share: f32) -> (usize, f32) {
+        let share = if share.is_finite() {
+            share.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+
+        let target = self.length() * share;
+        let index = self
+            .lengths
+            .partition_point(|&length| length < target)
+            .clamp(1, self.points.len() - 1);
+
+        let run = self.lengths[index] - self.lengths[index - 1];
+        let t = if run > 0.0 {
+            ((target - self.lengths[index - 1]) / run).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        (index, t)
     }
 
     /// Arc length of the cable.
@@ -246,20 +428,9 @@ impl CableGeometry {
             };
         }
 
-        let target = total * share;
-        let index = self
-            .lengths
-            .partition_point(|&length| length < target)
-            .clamp(1, self.points.len() - 1);
-
+        let (index, t) = self.locate(share);
         let from = self.points[index - 1];
         let to = self.points[index];
-        let run = self.lengths[index] - self.lengths[index - 1];
-        let t = if run > 0.0 {
-            ((target - self.lengths[index - 1]) / run).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
 
         let tangent = unit_or_x(to - from);
 
@@ -321,6 +492,9 @@ impl CableGeometry {
     }
 
     /// The point of the cable nearest to `pos`, if it lies within `tolerance` of it.
+    ///
+    /// A cable with half widths is also hit anywhere between its walls, however wide it is
+    /// there, and the point reported is the one on the stretch `pos` is deepest inside.
     #[must_use]
     pub fn hit(&self, pos: Pos2, tolerance: f32) -> Option<CableHit> {
         if !tolerance.is_finite() || tolerance < 0.0 {
@@ -331,8 +505,154 @@ impl CableGeometry {
             return None;
         }
 
-        let hit = self.closest(pos);
-        (hit.distance <= tolerance).then_some(hit)
+        let Some(radii) = &self.radii else {
+            let hit = self.closest(pos);
+            return (hit.distance <= tolerance).then_some(hit);
+        };
+
+        let mut best: Option<(f32, CableHit)> = None;
+        let total = self.length();
+
+        for index in 1..self.points.len() {
+            let from = self.points[index - 1];
+            let segment = self.points[index] - from;
+            let length_sq = segment.length_sq();
+
+            let t = if length_sq > 0.0 {
+                ((pos - from).dot(segment) / length_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let nearest = from + segment * t;
+            let distance = nearest.distance(pos);
+            let reach = egui::lerp(radii[index - 1]..=radii[index], t).max(tolerance);
+            let outside = distance - reach;
+
+            if outside <= 0.0 && best.is_none_or(|(least, _)| outside < least) {
+                let length = (self.lengths[index] - self.lengths[index - 1])
+                    .mul_add(t, self.lengths[index - 1]);
+
+                best = Some((
+                    outside,
+                    CableHit {
+                        pos: nearest,
+                        distance,
+                        share: if total > 0.0 {
+                            (length / total).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        },
+                    },
+                ));
+            }
+        }
+
+        best.map(|(_, hit)| hit)
+    }
+
+    /// The cable moved sideways: each point displaced along the normal there by `distance`
+    /// of the share of the arc length it lies at. Positive is the side
+    /// [`CableAnchor::normal`] points to.
+    ///
+    /// At a bend the displaced point sits on the mitre, so a constant distance gives a
+    /// parallel line.
+    #[must_use]
+    pub fn offset(&self, mut distance: impl FnMut(f32) -> f32) -> Vec<Pos2> {
+        let total = self.length();
+        let last = self.points.len() - 1;
+
+        (0..=last)
+            .map(|index| {
+                let before =
+                    (index > 0).then(|| unit_or_x(self.points[index] - self.points[index - 1]));
+                let after =
+                    (index < last).then(|| unit_or_x(self.points[index + 1] - self.points[index]));
+
+                let (tangent, mitre) = match (before, after) {
+                    (Some(before), Some(after)) => {
+                        let sum = before + after;
+                        let length = sum.length();
+                        if length > 1e-4 {
+                            let tangent = sum / length;
+                            // One over the cosine of half the turn.
+                            (tangent, (1.0 / tangent.dot(after).max(1e-4)).min(MAX_MITRE))
+                        } else {
+                            (after, 1.0)
+                        }
+                    }
+                    (Some(tangent), None) | (None, Some(tangent)) => (tangent, 1.0),
+                    (None, None) => (Vec2::X, 1.0),
+                };
+
+                let share = if total > 0.0 {
+                    self.lengths[index] / total
+                } else {
+                    0.0
+                };
+                let distance = distance(share);
+                let distance = if distance.is_finite() { distance } else { 0.0 };
+
+                self.points[index] + vec2(-tangent.y, tangent.x) * (distance * mitre)
+            })
+            .collect()
+    }
+
+    /// The two walls of a cable with half widths: the side [`CableAnchor::normal`] points
+    /// away from first, then the side it points to. Both run from the cable's start to its
+    /// end and hold one point for each of [`CableGeometry::points`].
+    ///
+    /// A cable without half widths gives its own path twice.
+    #[must_use]
+    pub fn walls(&self) -> [Vec<Pos2>; 2] {
+        [
+            self.offset(|share| -self.radius_at(share)),
+            self.offset(|share| self.radius_at(share)),
+        ]
+    }
+
+    /// The area between the walls of a cable with half widths, as one shape. `fill` gives
+    /// the colour at each share of the arc length and is blended from point to point, so
+    /// what flows in a tube can be painted as one connected band.
+    ///
+    /// The edges are not softened; stroke the [`CableGeometry::walls`] over them. A cable
+    /// without half widths gives a shape that paints nothing.
+    #[must_use]
+    pub fn ribbon(&self, mut fill: impl FnMut(f32) -> Color32) -> Shape {
+        if self
+            .radii
+            .as_ref()
+            .is_none_or(|radii| radii.iter().all(|&radius| radius <= 0.0))
+        {
+            return Shape::Noop;
+        }
+
+        let [near, far] = self.walls();
+        let total = self.length();
+
+        let mut mesh = Mesh::default();
+        mesh.reserve_vertices(2 * self.points.len());
+        mesh.reserve_triangles(2 * (self.points.len() - 1));
+
+        for (index, (&near, &far)) in near.iter().zip(&far).enumerate() {
+            let share = if total > 0.0 {
+                self.lengths[index] / total
+            } else {
+                0.0
+            };
+            let color = fill(share);
+            mesh.colored_vertex(near, color);
+            mesh.colored_vertex(far, color);
+
+            if index > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let corner = 2 * (index as u32 - 1);
+                mesh.add_triangle(corner, corner + 1, corner + 2);
+                mesh.add_triangle(corner + 1, corner + 3, corner + 2);
+            }
+        }
+
+        Shape::mesh(mesh)
     }
 
     /// The cable as a stroked shape.
@@ -429,6 +749,14 @@ fn sane_tolerance(tolerance: f32) -> f32 {
     }
 }
 
+fn sane_radius(radius: f32) -> f32 {
+    if radius.is_finite() && radius > 0.0 {
+        radius
+    } else {
+        0.0
+    }
+}
+
 fn unit_or_x(vector: Vec2) -> Vec2 {
     let length = vector.length();
     if length.is_finite() && length > 0.0 {
@@ -463,7 +791,7 @@ fn de_casteljau(control: &[Pos2], t: f32) -> Pos2 {
 
 #[cfg(test)]
 mod tests {
-    use egui::{emath::TSTransform, pos2, vec2};
+    use egui::{Color32, Shape, emath::TSTransform, pos2, vec2};
 
     use super::{CableGeometry, CableSway};
 
@@ -640,6 +968,183 @@ mod tests {
 
         assert_eq!(straight.sagged(vec2(0.0, 0.0), 0.25), straight);
         assert_eq!(straight.sagged(vec2(f32::NAN, 0.0), 0.25), straight);
+    }
+
+    /// A straight tube, 200 long, that is 2 wide except for a bulge of 14 around its middle.
+    fn bulged() -> CableGeometry {
+        CableGeometry::line(pos2(0.0, 0.0), pos2(200.0, 0.0))
+            .subdivided(2.0)
+            .with_radii(|share| {
+                let from_middle = (share - 0.5) / 0.1;
+                12.0f32.mul_add((-from_middle * from_middle).exp(), 2.0)
+            })
+    }
+
+    #[test]
+    fn subdividing_adds_points_and_keeps_the_path() {
+        let cable = elbow();
+        let fine = cable.subdivided(7.0);
+
+        assert!(fine.points().len() > 20);
+        assert!((fine.length() - cable.length()).abs() < 1e-3);
+        for &point in cable.points() {
+            assert!(fine.points().contains(&point), "{point:?} is kept");
+        }
+        for pair in fine.points().windows(2) {
+            assert!(pair[0].distance(pair[1]) <= 7.0 + 1e-3);
+        }
+        for &point in fine.points() {
+            assert!(cable.closest(point).distance < 1e-3);
+        }
+
+        // Nothing to do, or nothing sensible asked for.
+        assert_eq!(cable.subdivided(500.0), cable);
+        assert_eq!(cable.subdivided(0.0), cable);
+        assert_eq!(cable.subdivided(f32::NAN), cable);
+
+        // However fine the spacing, the number of points is bounded.
+        assert!(cable.subdivided(1e-6).points().len() <= 2 * super::MAX_SUBDIVIDED_POINTS);
+    }
+
+    #[test]
+    fn a_tube_is_hit_between_its_walls_and_nowhere_else() {
+        let tube = bulged();
+        assert!(tube.radii().is_some());
+        assert!((tube.radius_at(0.5) - 14.0).abs() < 0.05);
+        assert!((tube.radius_at(0.0) - 2.0).abs() < 0.05);
+
+        // Inside the bulge, far beyond the pick distance of a thin wire.
+        let inside = tube.hit(pos2(100.0, 12.0), 3.0).unwrap();
+        assert!(inside.pos.distance(pos2(100.0, 0.0)) < 1.0);
+        assert!((inside.distance - 12.0).abs() < 0.1);
+        assert!((inside.share - 0.5).abs() < 0.01);
+
+        // Just outside its wall.
+        assert!(tube.hit(pos2(100.0, 15.0), 0.5).is_none());
+
+        // The same distance from the path where the tube is thin.
+        assert!(tube.hit(pos2(30.0, 12.0), 3.0).is_none());
+        assert!(tube.hit(pos2(30.0, 2.5), 3.0).is_some());
+
+        // The thin wire this tube is drawn around would not have been hit in the bulge.
+        let wire = CableGeometry::line(pos2(0.0, 0.0), pos2(200.0, 0.0));
+        assert!(wire.hit(pos2(100.0, 12.0), 3.0).is_none());
+        assert_eq!(wire.radii(), None);
+        assert_eq!(wire.radius_at(0.5).to_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn bounds_of_a_tube_hold_its_walls() {
+        let tube = bulged();
+        let bounds = tube.bounds();
+
+        assert!((bounds.top() + 14.0).abs() < 0.05 && (bounds.bottom() - 14.0).abs() < 0.05);
+        assert!((bounds.left() + 2.0).abs() < 0.05 && (bounds.right() - 202.0).abs() < 0.05);
+
+        for wall in tube.walls() {
+            for point in wall {
+                assert!(bounds.expand(1e-3).contains(point));
+            }
+        }
+    }
+
+    #[test]
+    fn walls_keep_their_distance_around_a_bend() {
+        let tube = elbow().with_radii(|_| 5.0);
+        let [near, far] = tube.walls();
+
+        assert_eq!(near.len(), 3);
+        assert_eq!(far.len(), 3);
+
+        // The cable runs right, then down. Its normal points down, then left.
+        assert!(far[0].distance(pos2(0.0, 5.0)) < 1e-3);
+        assert!(near[0].distance(pos2(0.0, -5.0)) < 1e-3);
+
+        // At the corner each wall sits on the mitre, so both of its runs stay 5 away.
+        assert!(far[1].distance(pos2(95.0, 5.0)) < 1e-3);
+        assert!(near[1].distance(pos2(105.0, -5.0)) < 1e-3);
+
+        assert!(far[2].distance(pos2(95.0, 50.0)) < 1e-3);
+        assert!(near[2].distance(pos2(105.0, 50.0)) < 1e-3);
+
+        // A path with no width has its walls on itself.
+        let [near, far] = elbow().walls();
+        assert_eq!(near, elbow().points());
+        assert_eq!(far, elbow().points());
+    }
+
+    #[test]
+    fn a_ribbon_fills_the_tube_from_wall_to_wall_in_the_colours_given() {
+        let tube = bulged();
+        let [near, far] = tube.walls();
+
+        let Shape::Mesh(mesh) = tube.ribbon(|share| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Color32::from_gray((share * 255.0) as u8)
+        }) else {
+            panic!("a tube has an area to fill");
+        };
+
+        assert!(mesh.is_valid());
+        assert_eq!(mesh.vertices.len(), 2 * tube.points().len());
+        assert_eq!(mesh.indices.len(), 6 * (tube.points().len() - 1));
+
+        for (index, pair) in mesh.vertices.chunks(2).enumerate() {
+            assert_eq!(pair[0].pos, near[index]);
+            assert_eq!(pair[1].pos, far[index]);
+            assert_eq!(pair[0].color, pair[1].color);
+        }
+        assert_eq!(mesh.vertices[0].color, Color32::from_gray(0));
+        assert_eq!(mesh.vertices.last().unwrap().color, Color32::from_gray(255));
+
+        // Every triangle has an area: the band is connected and nowhere folded shut.
+        for triangle in mesh.indices.chunks(3) {
+            let [a, b, c] = [0, 1, 2].map(|corner| mesh.vertices[triangle[corner] as usize].pos);
+            let area = (b - a).x.mul_add((c - a).y, -((b - a).y * (c - a).x)).abs() / 2.0;
+            assert!(area > 0.0);
+        }
+
+        assert_eq!(elbow().ribbon(|_| Color32::WHITE), Shape::Noop);
+        assert_eq!(
+            elbow().with_radii(|_| 0.0).ribbon(|_| Color32::WHITE),
+            Shape::Noop
+        );
+    }
+
+    #[test]
+    fn half_widths_follow_a_section_a_sag_and_a_transform() {
+        let tube = bulged();
+
+        let section = tube.section(0.75, 0.4);
+        assert!(section.start().distance(pos2(80.0, 0.0)) < 1e-3);
+        assert!(section.end().distance(pos2(150.0, 0.0)) < 1e-3);
+        assert!((section.length() - 70.0).abs() < 1e-3);
+        for share in [0.0, 0.3, 0.7, 1.0] {
+            let along = egui::lerp(0.4..=0.75, share);
+            assert!(
+                (section.radius_at(share) - tube.radius_at(along)).abs() < 0.05,
+                "share {share}"
+            );
+        }
+
+        let sagged = tube.sagged(vec2(0.0, 30.0), 0.25);
+        assert!((sagged.radius_at(0.5) - 14.0).abs() < 0.2);
+        assert!(sagged.hit(pos2(100.0, 42.0), 0.5).is_some());
+        assert!(sagged.hit(pos2(100.0, 12.0), 0.5).is_none());
+
+        let moved = tube.transformed(TSTransform::new(vec2(10.0, 20.0), 2.0));
+        assert!((moved.radius_at(0.5) - 28.0).abs() < 0.1);
+        assert!(moved.hit(pos2(210.0, 44.0), 0.5).is_some());
+        assert!(moved.hit(pos2(210.0, 50.0), 0.5).is_none());
+
+        // A path without half widths gains none on the way.
+        assert_eq!(elbow().section(0.2, 0.8).radii(), None);
+        assert_eq!(elbow().subdivided(5.0).radii(), None);
+        assert_eq!(elbow().sagged(vec2(0.0, 9.0), 0.25).radii(), None);
+
+        // Half widths that make no sense count as none.
+        let odd = elbow().with_radii(|share| if share < 0.5 { -3.0 } else { f32::NAN });
+        assert_eq!(odd.radii(), Some(&[0.0, 0.0, 0.0][..]));
     }
 
     #[test]
