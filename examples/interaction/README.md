@@ -99,6 +99,9 @@ painted on it. None of this is used unless a viewer calls it.
 - `WirePaint::under_shape(shape)` / `over_shape(shape)` paint any `egui::Shape`, in graph
   coordinates, with the wire: in its layer, inside the clip of the view, behind and in
   front of its strokes and beads.
+- `WirePaint::front_shape(shape)` paints a shape in front of the nodes whichever layer
+  the wire is in: a fitting or a glow on the pin a wire meets, while the wire itself runs
+  behind the node. It is painting only; the pin under it still takes the pointer.
 - `wire_route` is asked on every pass, so a tube may change from frame to frame; the pass
   that paints a shape is the pass that picks along it. Ask for the next frame yourself
   (`Context::request_repaint`) while something moves.

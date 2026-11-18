@@ -28,6 +28,7 @@ const BEAD_RADIUS: f32 = 5.0;
 /// Colours no pin, node or default wire is drawn in.
 const TUBE_FILL: Color32 = Color32::from_rgb(20, 250, 240);
 const TUBE_WALL: Color32 = Color32::from_rgb(240, 20, 250);
+const TUBE_PLUG: Color32 = Color32::from_rgb(250, 240, 20);
 
 fn view(name: &str) -> Id {
     Id::unique(name)
@@ -229,6 +230,7 @@ impl SnarlViewer<Node> for Viewer {
                 .under_shape(wire.geometry.ribbon(|_| TUBE_FILL))
                 .over_shape(Shape::line(near, (1.0, TUBE_WALL)))
                 .over_shape(Shape::line(far, (1.0, TUBE_WALL)))
+                .front_shape(Shape::circle_filled(wire.geometry.end(), 5.0, TUBE_PLUG))
         } else if self.glow {
             WirePaint::solid((6.0, wire.color)).with_glow(Color32::from_rgb(255, 140, 60), 8.0)
         } else {
@@ -1153,6 +1155,35 @@ fn shapes_a_viewer_adds_to_a_wire_are_painted_in_the_layer_of_that_wire() {
             WireLayer::BehindNodes => assert!(far < node, "{what}"),
             WireLayer::AboveNodes => assert!(ribbon > node, "{what}"),
         }
+
+        // What the wire puts in front of the nodes is in front of them, and of the rest
+        // of the wire, whichever layer the wire is in.
+        let plug = shapes
+            .iter()
+            .position(|shape| matches!(shape, Shape::Circle(circle) if circle.fill == TUBE_PLUG))
+            .expect("the plug was painted");
+        let end = anatomy.in_pin(tube.in_pin).unwrap().screen_center;
+        assert!(
+            matches!(shapes[plug], Shape::Circle(circle) if circle.center.distance(end) < 0.5),
+            "{what}: the plug sits on the pin the tube ends at"
+        );
+
+        let last_frame = [left, between, right]
+            .into_iter()
+            .map(|id| {
+                let frame = anatomy.node(id).unwrap().screen_rect;
+                shapes
+                    .iter()
+                    .rposition(|shape| {
+                        matches!(shape, Shape::Rect(rect)
+                            if rect.rect.min.distance(frame.min) < 0.5
+                                && rect.rect.max.distance(frame.max) < 0.5)
+                    })
+                    .expect("the frame of every node was painted")
+            })
+            .max()
+            .unwrap();
+        assert!(plug > last_frame && plug > far, "{what}");
     }
 }
 

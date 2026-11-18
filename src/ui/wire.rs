@@ -832,13 +832,16 @@ pub struct WireBead {
 /// A viewer that needs more than strokes and discs adds shapes of its own with
 /// [`WirePaint::under_shape`] and [`WirePaint::over_shape`]. They are painted with the wire:
 /// in its layer, inside the clip of the view, in graph coordinates, behind and in front of
-/// its strokes and discs.
+/// its strokes and discs. [`WirePaint::front_shape`] adds a shape that is painted in front of
+/// the nodes even when the wire itself runs behind them, for a fitting where a wire meets a
+/// node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WirePaint {
     shapes_under: Vec<Shape>,
     strokes: SmallVec<[Stroke; 4]>,
     beads: SmallVec<[WireBead; 4]>,
     shapes_over: Vec<Shape>,
+    shapes_in_front: Vec<Shape>,
     hit_width: f32,
     layer: Option<WireLayer>,
 }
@@ -853,6 +856,7 @@ impl WirePaint {
             strokes: smallvec::smallvec![stroke],
             beads: SmallVec::new(),
             shapes_over: Vec::new(),
+            shapes_in_front: Vec::new(),
             hit_width: stroke.width,
             layer: None,
         }
@@ -869,6 +873,7 @@ impl WirePaint {
             strokes: SmallVec::new(),
             beads: SmallVec::new(),
             shapes_over: Vec::new(),
+            shapes_in_front: Vec::new(),
             hit_width: 0.0,
             layer: None,
         }
@@ -946,6 +951,20 @@ impl WirePaint {
         self
     }
 
+    /// Adds a shape that is painted in front of the nodes, whichever layer the wire is
+    /// painted in, and in front of the shapes added this way before it.
+    ///
+    /// It is for what sits on a node where the wire meets it: a fitting, a plug, a glow on
+    /// a socket. The rest of the wire stays in its layer. The shape is in graph coordinates
+    /// and inside the clip of the view, as the others are.
+    ///
+    /// Only painting is added. A shape over a pin does not take the pointer from the pin.
+    #[must_use]
+    pub fn front_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_in_front.push(shape.into());
+        self
+    }
+
     /// Sets the width of the band in which the pointer counts as being on the wire.
     ///
     /// Defaults to the width of the stroke given to [`WirePaint::solid`]. A glow does not widen it,
@@ -996,6 +1015,13 @@ impl WirePaint {
         &self.shapes_over
     }
 
+    /// Shapes painted in front of the nodes, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_in_front(&self) -> &[Shape] {
+        &self.shapes_in_front
+    }
+
     /// Width of the band in which the pointer counts as being on the wire.
     #[must_use]
     #[inline]
@@ -1017,8 +1043,37 @@ impl WirePaint {
             .fold(0.0, f32::max)
     }
 
-    /// Appends the shapes that paint `geometry` this way, unless it lies outside `clip_rect`.
+    /// Whether anything this paints for `geometry` reaches into `clip_rect`.
+    fn reaches(&self, geometry: &CableGeometry, clip_rect: Rect) -> bool {
+        let reach = self
+            .beads
+            .iter()
+            .map(|bead| bead.radius)
+            .fold(self.widest() * 0.5, f32::max);
+
+        let mut covered = geometry.bounds().expand(reach);
+        for shape in self
+            .shapes_under
+            .iter()
+            .chain(&self.shapes_over)
+            .chain(&self.shapes_in_front)
+        {
+            covered |= shape.visual_bounding_rect();
+        }
+
+        covered.intersects(clip_rect)
+    }
+
+    /// Appends the shapes that paint `geometry` this way in the layer of the wire, unless
+    /// the wire lies outside `clip_rect`.
+    ///
+    /// Shapes added with [`WirePaint::front_shape`] are not among them:
+    /// [`WirePaint::paint_in_front`] appends those.
     pub fn paint(&self, geometry: &CableGeometry, clip_rect: Rect, shapes: &mut Vec<Shape>) {
+        if !self.reaches(geometry, clip_rect) {
+            return;
+        }
+
         let strokes = self
             .strokes
             .iter()
@@ -1029,26 +1084,25 @@ impl WirePaint {
             .iter()
             .filter(|bead| bead.radius > 0.0 && bead.fill != Color32::TRANSPARENT);
 
-        let reach = beads
-            .clone()
-            .map(|bead| bead.radius)
-            .fold(self.widest() * 0.5, f32::max);
-
-        let mut covered = geometry.bounds().expand(reach);
-        for shape in self.shapes_under.iter().chain(&self.shapes_over) {
-            covered |= shape.visual_bounding_rect();
-        }
-
-        if !covered.intersects(clip_rect) {
-            return;
-        }
-
         shapes.extend(self.shapes_under.iter().cloned());
         shapes.extend(strokes.map(|&stroke| geometry.stroke(stroke)));
         shapes.extend(beads.map(|bead| {
             Shape::circle_filled(geometry.anchor_at(bead.share).pos, bead.radius, bead.fill)
         }));
         shapes.extend(self.shapes_over.iter().cloned());
+    }
+
+    /// Appends the shapes added with [`WirePaint::front_shape`], unless the wire lies
+    /// outside `clip_rect`. They belong in front of the nodes.
+    pub fn paint_in_front(
+        &self,
+        geometry: &CableGeometry,
+        clip_rect: Rect,
+        shapes: &mut Vec<Shape>,
+    ) {
+        if !self.shapes_in_front.is_empty() && self.reaches(geometry, clip_rect) {
+            shapes.extend(self.shapes_in_front.iter().cloned());
+        }
     }
 }
 
@@ -1216,6 +1270,54 @@ mod tests {
         // Nothing is painted for a wire that was given no shape.
         assert!(WirePaint::hidden().shapes_under().is_empty());
         assert!(WirePaint::hidden().shapes_over().is_empty());
+        assert!(WirePaint::hidden().shapes_in_front().is_empty());
+    }
+
+    #[test]
+    fn shapes_for_the_front_of_the_nodes_are_kept_apart_and_count_for_culling() {
+        let cable = route(WireStyle::Line).default_route();
+        let mark = |x: f32| Shape::circle_filled(pos2(x, 500.0), 4.0, Color32::RED);
+
+        let plain = WirePaint::solid((3.0, Color32::WHITE)).over_shape(mark(1.0));
+        let paint = plain.clone().front_shape(mark(2.0)).front_shape(mark(3.0));
+        assert_eq!(paint.shapes_in_front().len(), 2);
+
+        // The wire's own layer gets what it got without them.
+        let (mut own, mut expected) = (Vec::new(), Vec::new());
+        paint.paint(&cable, Rect::EVERYTHING, &mut own);
+        plain.paint(&cable, Rect::EVERYTHING, &mut expected);
+        assert_eq!(own, expected);
+
+        // They are handed over separately, in the order they were given.
+        let mut front = Vec::new();
+        paint.paint_in_front(&cable, Rect::EVERYTHING, &mut front);
+        let order: Vec<f32> = front
+            .iter()
+            .map(|shape| match shape {
+                Shape::Circle(circle) => circle.center.x,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(order, [2.0, 3.0]);
+
+        // A view that shows only one of them still gets the whole wire.
+        let around = Rect::from_center_size(pos2(3.0, 500.0), vec2(1.0, 1.0));
+        assert!(!cable.bounds().expand(10.0).intersects(around));
+        let (mut own, mut front) = (Vec::new(), Vec::new());
+        paint.paint(&cable, around, &mut own);
+        paint.paint_in_front(&cable, around, &mut front);
+        assert_eq!((own.len(), front.len()), (2, 2));
+
+        // A view that shows nothing of the wire gets none.
+        let away = Rect::from_center_size(pos2(-900.0, -900.0), vec2(10.0, 10.0));
+        let (mut own, mut front) = (Vec::new(), Vec::new());
+        paint.paint(&cable, away, &mut own);
+        paint.paint_in_front(&cable, away, &mut front);
+        assert!(own.is_empty() && front.is_empty());
+
+        // A wire with nothing for the front adds nothing.
+        plain.paint_in_front(&cable, Rect::EVERYTHING, &mut front);
+        assert!(front.is_empty());
     }
 
     #[test]

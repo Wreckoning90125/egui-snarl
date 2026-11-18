@@ -1679,12 +1679,18 @@ where
 
     let mut wires_behind = Vec::new();
     let mut wires_above = Vec::new();
+
+    // What wires paint in front of the nodes whichever layer they are in.
+    let mut wires_in_front = Vec::new();
+
     for wire in &laid_wires {
         let shapes = match wire.paint.layer().unwrap_or(wire_layer) {
             WireLayer::BehindNodes => &mut wires_behind,
             WireLayer::AboveNodes => &mut wires_above,
         };
         wire.paint.paint(&wire.geometry, ui.clip_rect(), shapes);
+        wire.paint
+            .paint_in_front(&wire.geometry, ui.clip_rect(), &mut wires_in_front);
     }
 
     // Widgets riding on the middle of wires.
@@ -2018,11 +2024,15 @@ where
             WireLayer::AboveNodes => &mut wires_above,
         };
         paint.paint(&geometry, ui.clip_rect(), shapes);
+        paint.paint_in_front(&geometry, ui.clip_rect(), &mut wires_in_front);
     }
 
     ui.painter().set(wires_behind_idx, Shape::Vec(wires_behind));
     if !wires_above.is_empty() {
         ui.painter().add(Shape::Vec(wires_above));
+    }
+    if !wires_in_front.is_empty() {
+        ui.painter().add(Shape::Vec(wires_in_front));
     }
 
     ui.advance_cursor_after_rect(Rect::from_min_size(snarl_resp.rect.min, Vec2::ZERO));
