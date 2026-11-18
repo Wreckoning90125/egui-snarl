@@ -53,6 +53,9 @@ impl Node {
 struct Viewer {
     glow: bool,
     custom_route: bool,
+
+    /// Length, in screen points, of the straight lead the route leaves each pin with.
+    screen_lead: Option<f32>,
     wire_menu: bool,
     graph_menu: bool,
 
@@ -165,6 +168,16 @@ impl SnarlViewer<Node> for Viewer {
     }
 
     fn wire_route(&mut self, route: &WireRoute, _snarl: &Snarl<Node>) -> Option<CableGeometry> {
+        if let Some(lead) = self.screen_lead {
+            let lead = vec2(lead / route.scale, 0.0);
+            return Some(CableGeometry::from_points([
+                route.from,
+                route.from + lead,
+                route.to - lead,
+                route.to,
+            ]));
+        }
+
         self.custom_route.then(|| {
             let corner = pos2(route.to.x, route.from.y);
             CableGeometry::from_points([route.from, corner, route.to])
@@ -630,6 +643,52 @@ fn a_wire_is_painted_and_hit_tested_along_one_path_at_every_zoom() {
             }
         }
     }
+}
+
+#[test]
+fn a_route_can_keep_a_length_on_screen_at_every_zoom() {
+    let (snarl, wire) = pair(true);
+    let mut world = World::new(
+        snarl,
+        Viewer {
+            screen_lead: Some(24.0),
+            ..Viewer::default()
+        },
+    );
+
+    let mut scales = Vec::new();
+    for zoom in [1.0, 0.3, 2.5] {
+        let spot = empty_spot(&world.outer());
+        world.zoom_at(spot, zoom);
+        world.settle();
+
+        let anatomy = world.outer();
+        let scale = anatomy.transform.scale();
+        scales.push(scale);
+
+        let on_screen = anatomy
+            .wire(wire)
+            .expect("the wire was measured")
+            .geometry
+            .transformed(anatomy.transform.to_global);
+
+        let [from, lead_out, lead_in, to] = on_screen.points() else {
+            panic!("the viewer's route has four points");
+        };
+        assert!(
+            (from.distance(*lead_out) - 24.0).abs() < 1e-2,
+            "lead out of the pin at scale {scale}"
+        );
+        assert!(
+            (lead_in.distance(*to) - 24.0).abs() < 1e-2,
+            "lead into the pin at scale {scale}"
+        );
+    }
+
+    assert!(
+        scales[1] < 0.75 && scales[2] > 1.25,
+        "the view was zoomed out and in: {scales:?}"
+    );
 }
 
 #[test]

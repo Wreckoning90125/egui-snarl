@@ -1415,6 +1415,7 @@ where
                 to,
             ),
             tolerance: wire_threshold,
+            scale,
             sag,
         };
 
@@ -1890,6 +1891,7 @@ where
                 to,
             ),
             tolerance: wire_threshold,
+            scale,
             sag: vec2(0.0, wire_slack * from.distance(to)),
         };
 

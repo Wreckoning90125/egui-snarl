@@ -673,6 +673,12 @@ pub struct WireRoute {
     /// Largest distance the path may stray from the ideal curve.
     pub tolerance: f32,
 
+    /// Screen points per graph unit.
+    ///
+    /// A route that keeps some length the same on screen at every zoom divides that length
+    /// by this.
+    pub scale: f32,
+
     /// Displacement asked of the middle of the wire by [`SnarlStyle::wire_slack`](super::SnarlStyle::wire_slack)
     /// and [`SnarlStyle::wire_sway`](super::SnarlStyle::wire_sway). Zero when both are off.
     pub sag: Vec2,
@@ -973,6 +979,7 @@ mod tests {
             style,
             frame_size: 30.0,
             tolerance: 1.0,
+            scale: 1.0,
             sag: vec2(0.0, 0.0),
         }
     }
