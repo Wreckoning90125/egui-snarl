@@ -2234,9 +2234,10 @@ where
         outputs_ui.scope_builder(builder, |pin_ui| {
             // Allocate space for pin shape.
             if let Some(output_spacing) = output_spacing {
-                let min = pin_ui.next_widget_position();
+                // The row is laid out right to left, so the pin's space ends at the cursor.
+                let max = pin_ui.next_widget_position();
                 pin_ui.advance_cursor_after_rect(Rect::from_min_size(
-                    min,
+                    pos2(max.x - output_spacing, max.y),
                     vec2(output_spacing, pin_size),
                 ));
             }

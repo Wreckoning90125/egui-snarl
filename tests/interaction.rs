@@ -62,6 +62,9 @@ struct Viewer {
     moved: Vec<(Vec<NodeId>, Vec2, bool)>,
     passes: Vec<Arc<SnarlAnatomy>>,
 
+    /// Where the label of each output row was laid out in the last pass.
+    output_labels: Vec<(OutPinId, Rect)>,
+
     graph_menu_positions: Vec<Pos2>,
     graph_menu_popup_corners: Vec<Pos2>,
     graph_menu_section: Option<Rect>,
@@ -106,11 +109,13 @@ impl SnarlViewer<Node> for Viewer {
 
     fn show_output(
         &mut self,
-        _pin: &OutPin,
+        pin: &OutPin,
         ui: &mut Ui,
         _snarl: &mut Snarl<Node>,
     ) -> impl SnarlPin + 'static {
-        ui.label("out");
+        let label = ui.label("out").rect;
+        self.output_labels.retain(|(id, _)| *id != pin.id);
+        self.output_labels.push((pin.id, label));
         PinInfo::circle().with_fill(Color32::LIGHT_RED)
     }
 
@@ -633,6 +638,30 @@ fn a_row_that_resizes_carries_its_pin_in_the_same_pass() {
     let shrunk = *world.viewer.passes[0].in_pin(first).unwrap();
     assert!((shrunk.graph_center.y - shrunk.row_rect.center().y).abs() < 1e-3);
     assert!(shrunk.row_rect.height() < first_resized.row_rect.height() / 2.0);
+}
+
+#[test]
+fn what_an_output_row_shows_stops_short_of_its_pin() {
+    let (snarl, wire) = pair(true);
+    let mut world = World::new(snarl, Viewer::default());
+    let _ = world.settle();
+
+    let anatomy = world.outer();
+    let pin = *anatomy.out_pin(wire.out_pin).unwrap();
+    let (_, label) = *world
+        .viewer
+        .output_labels
+        .iter()
+        .find(|(id, _)| *id == wire.out_pin)
+        .unwrap();
+
+    assert!(
+        label.right() <= pin.graph_rect.left(),
+        "the label ends at {} and the pin starts at {}",
+        label.right(),
+        pin.graph_rect.left()
+    );
+    assert!(!label.intersects(pin.graph_rect));
 }
 
 #[test]
