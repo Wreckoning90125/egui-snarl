@@ -6,20 +6,28 @@
 //!
 //! The viewer changes nothing but wires, and only through `wire_route` and `wire_paint`.
 //! With [`Look::Plain`] it returns what the view offered, and the graph is an ordinary one.
+//!
+//! The nodes are laid out the way the application that uses this crate lays out its
+//! canvas: pins on the edge of the node, a title at the left of a header with no arrow.
+//! That is [`canvas`], and all three looks share it.
 
 use std::{collections::HashMap, fmt::Write as _};
 
-use egui::{Color32, Id, Pos2, Ui, pos2};
+use egui::{
+    Color32, CornerRadius, Frame, Id, Margin, Pos2, RichText, Stroke, Ui, Vec2, pos2, vec2,
+};
 use egui_snarl::{
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
     ui::{
-        CableGeometry, PinInfo, SnarlAnatomy, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget,
-        WirePaint, WirePins, WireRoute, WireView,
+        BackgroundPattern, CableGeometry, Grid, NodeLayout, PinInfo, PinPlacement, SnarlAnatomy,
+        SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget, WireLayer, WirePaint, WirePins, WireRoute,
+        WireStyle, WireView,
     },
 };
 
 use super::{
-    flow::{BALLOON_LIMITS, Mechanism, Pipe},
+    drive::{Drives, Forcing, Lay},
+    flow::{Mechanism, Params, Pipe},
     pipe, tube,
 };
 
@@ -92,16 +100,23 @@ pub struct Viewer {
     pub look: Look,
     pub assign: Assign,
 
-    /// How hard the sources push, in `-1.0..=1.0`. Negative pulls.
-    pub command: f32,
+    /// What acts on the pipes: the signal, gravity, and whatever else is plugged in.
+    pub drives: Drives,
+
+    /// Every number the models use.
+    pub params: Params,
+
+    /// How a pipe is drawn.
+    pub style: pipe::Style,
 
     pipes: HashMap<WirePins, Pipe>,
 
-    /// Length of each pipe at rest, as last laid out.
-    lengths: HashMap<WirePins, f32>,
+    /// Where each pipe lies at rest, as last laid out.
+    lays: HashMap<WirePins, Lay>,
 
-    /// Time on the clock the beads run by. It runs backwards under a negative command.
-    bead_time: f32,
+    /// Time on the clock the beads of each wire run by. It runs backwards while the wire
+    /// is pulled on.
+    bead_times: HashMap<WirePins, f32>,
 
     fit_passes: u8,
 }
@@ -111,10 +126,12 @@ impl Viewer {
         Self {
             look: Look::Pipes,
             assign: Assign::Each,
-            command: 0.8,
+            drives: Drives::default(),
+            params: Params::default(),
+            style: pipe::Style::default(),
             pipes: HashMap::new(),
-            lengths: HashMap::new(),
-            bead_time: 0.0,
+            lays: HashMap::new(),
+            bead_times: HashMap::new(),
             fit_passes: 0,
         }
     }
@@ -139,31 +156,54 @@ impl Viewer {
             .collect();
 
         self.pipes.retain(|pins, _| wires.contains(pins));
-        self.lengths.retain(|pins, _| wires.contains(pins));
+        self.lays.retain(|pins, _| wires.contains(pins));
+        self.bead_times.retain(|pins, _| wires.contains(pins));
+
+        let moving = seconds.is_finite() && seconds > 0.0;
+        if moving {
+            self.drives.advance(seconds);
+        }
 
         for pins in wires {
             let mechanism = self.mechanism(snarl, pins.in_pin.node);
-            let length = self.lengths.get(&pins).copied().unwrap_or(UNMEASURED);
+            let lay = self.lay(pins);
+            let forcing = self.drives.forcing(&lay);
 
+            let params = &self.params;
             let pipe = self
                 .pipes
                 .entry(pins)
                 .and_modify(|pipe| {
                     if pipe.mechanism() != mechanism {
-                        *pipe = Pipe::new(mechanism, length);
+                        *pipe = Pipe::new(mechanism, params, lay.length);
                     }
                 })
-                .or_insert_with(|| Pipe::new(mechanism, length));
+                .or_insert_with(|| Pipe::new(mechanism, params, lay.length));
 
-            pipe.advance(self.command, length, seconds);
-        }
+            pipe.advance(params, &forcing, &lay, seconds);
 
-        if seconds.is_finite() && seconds > 0.0 {
-            self.bead_time = self
-                .command
-                .mul_add(seconds.min(0.2), self.bead_time)
-                .rem_euclid(3600.0);
+            // The beads of a wire are driven by what drives its pipe.
+            if moving {
+                let time = self.bead_times.entry(pins).or_insert(0.0);
+                *time = forcing
+                    .drive(&lay, params.full_head())
+                    .mul_add(seconds.min(0.2), *time)
+                    .rem_euclid(3600.0);
+            }
         }
+    }
+
+    /// Where the pipe of `wire` lies, or a level pipe if it has not been laid out yet.
+    pub fn lay(&self, wire: WirePins) -> Lay {
+        self.lays.get(&wire).copied().unwrap_or(Lay {
+            wire: Some(wire),
+            ..Lay::level(UNMEASURED)
+        })
+    }
+
+    /// Everything that acts on the pipe of `wire` from outside, added up.
+    pub fn forcing(&self, wire: WirePins) -> Forcing {
+        self.drives.forcing(&self.lay(wire))
     }
 
     /// What moves the pipe into `node`.
@@ -181,7 +221,7 @@ impl Viewer {
     /// Puts every pipe back to rest.
     pub fn reset(&mut self) {
         self.pipes.clear();
-        self.bead_time = 0.0;
+        self.bead_times.clear();
     }
 }
 
@@ -193,6 +233,18 @@ impl SnarlViewer<Node> for Viewer {
                 mechanism.name().to_owned()
             }
         }
+    }
+
+    fn show_header(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut Ui,
+        snarl: &mut Snarl<Node>,
+    ) {
+        let title = self.title(&snarl[node]);
+        ui.add(egui::Label::new(RichText::new(title).strong()).selectable(false));
     }
 
     fn inputs(&mut self, node: &Node) -> usize {
@@ -235,15 +287,36 @@ impl SnarlViewer<Node> for Viewer {
 
         match self.look {
             Look::Plain => None,
-            Look::Beads => Some(tube::route(route)),
+            Look::Beads => {
+                let path = tube::route(route);
+
+                // A view of pipes, if there is one, knows the lay of the pipe better.
+                let _ = self.lays.entry(pins).or_insert(Lay {
+                    wire: Some(pins),
+                    from: route.from,
+                    to: route.to,
+                    length: path.length(),
+                });
+                Some(path)
+            }
             Look::Pipes => {
                 let mechanism = self.mechanism(snarl, pins.in_pin.node);
-                let _ = self
-                    .lengths
-                    .insert(pins, pipe::rest(route, mechanism).length());
+                let lay = Lay {
+                    wire: Some(pins),
+                    from: route.from,
+                    to: route.to,
+                    length: pipe::rest(route, mechanism, &self.params).length(),
+                };
+                let _ = self.lays.insert(pins, lay);
 
                 let pipe = self.pipes.get(&pins)?;
-                Some(pipe::route(route, pipe))
+                Some(pipe::route(
+                    route,
+                    pipe,
+                    &self.params,
+                    &self.drives.forcing(&lay),
+                    &self.style,
+                ))
             }
         }
     }
@@ -261,10 +334,15 @@ impl SnarlViewer<Node> for Viewer {
 
         match self.look {
             Look::Plain => default,
-            Look::Beads => tube::paint(wire, pigments[0], Some(self.bead_time)),
+            Look::Beads => {
+                let time = self.bead_times.get(&pins).copied().unwrap_or(0.0);
+                tube::paint(wire, pigments[0], Some(time))
+            }
             Look::Pipes => match self.pipes.get(&pins) {
                 // Only a path that came from `pipe::route` has walls to fill.
-                Some(pipe) if wire.geometry.radii().is_some() => pipe::paint(wire, pipe, &pigments),
+                Some(pipe) if wire.geometry.radii().is_some() => {
+                    pipe::paint(wire, pipe, &pigments, &self.style)
+                }
                 _ => default,
             },
         }
@@ -282,14 +360,55 @@ impl SnarlViewer<Node> for Viewer {
     }
 }
 
-/// The style a look is shown with. A plain graph is given no style of its own at all.
+/// How the nodes and the canvas look, whatever the wires are shown as.
+///
+/// It follows the canvas of the application that uses this crate: nodes with their pins
+/// on the edge, rows of one height, a header without the arrow that folds a node, and
+/// wires that leave a pin level and run behind the nodes. Nothing here is about what a
+/// wire does when it is pointed at or clicked.
+pub fn canvas() -> SnarlStyle {
+    let frame = |margin: i8, fill: u8, stroke: Stroke| Frame {
+        inner_margin: Margin::same(margin),
+        outer_margin: Margin::ZERO,
+        corner_radius: CornerRadius::same(10),
+        fill: Color32::from_gray(fill),
+        stroke,
+        shadow: egui::Shadow::NONE,
+    };
+
+    SnarlStyle {
+        node_layout: Some(
+            NodeLayout::coil()
+                .with_min_pin_row_height(24.0)
+                .with_equal_pin_rows(),
+        ),
+        node_frame: Some(frame(8, 0x2a, Stroke::new(1.0, Color32::from_gray(0x4a)))),
+        header_frame: Some(frame(6, 0x3a, Stroke::NONE)),
+        bg_frame: Some(Frame {
+            corner_radius: CornerRadius::ZERO,
+            ..frame(2, 0x20, Stroke::NONE)
+        }),
+        bg_pattern: Some(BackgroundPattern::Grid(Grid::new(vec2(28.0, 28.0), 0.0))),
+        bg_pattern_stroke: Some(Stroke::new(0.6, Color32::from_gray(0x33))),
+        wire_style: Some(WireStyle::Bezier3),
+        wire_layer: Some(WireLayer::BehindNodes),
+        pin_size: Some(8.0),
+        pin_placement: Some(PinPlacement::Edge),
+        header_drag_space: Some(Vec2::ZERO),
+        collapsible: Some(false),
+        ..SnarlStyle::new()
+    }
+}
+
+/// The style a look is shown with. A plain graph is asked nothing of its wires: it has
+/// the canvas and no more.
 pub fn style(look: Look) -> SnarlStyle {
     match look {
-        Look::Plain => SnarlStyle::new(),
+        Look::Plain => canvas(),
         Look::Beads | Look::Pipes => SnarlStyle {
             wire_picking: Some(true),
             nodes_cover_wires: Some(true),
-            ..SnarlStyle::new()
+            ..canvas()
         },
     }
 }
@@ -323,10 +442,14 @@ pub fn readout(
     let mechanism = viewer.mechanism(snarl, wire.pins.in_pin.node);
     let pipe = viewer.pipe(wire.pins)?;
 
+    let lay = viewer.lay(wire.pins);
+    let forcing = viewer.forcing(wire.pins);
+    let full_head = viewer.params.full_head();
+
     let mut words = format!(
         "Pointer on {}: {:.0}% along, {:.1} from the centreline, wall at {:.1}; \
          cross-section x{:.2}, contents moving at {:.0}; the pipe holds x{:.2} of what it \
-         holds at rest",
+         holds at rest. Driven at {:+.2} by {}: pump {:+.2}, head {:+.2}, valve {:.2}",
         mechanism.name(),
         100.0 * hit.share,
         hit.distance,
@@ -334,16 +457,21 @@ pub fn readout(
         pipe.area_at(hit.share),
         pipe.speed_at(hit.share),
         pipe.volume(1.0),
+        pipe.drive(),
+        viewer.drives.active().join(" and "),
+        forcing.push,
+        forcing.head(&lay) / full_head,
+        forcing.opening,
     );
 
     match mechanism {
         Mechanism::Balloon => {
+            let (gives_way, gives_back) = viewer.params.balloon.limits();
             let _ = write!(
                 words,
-                "; soft stretch filled to {:.2} (gives way at {:.1}, gives back at {:.1})",
+                "; soft stretch filled to {:.2} (gives way at {gives_way:.1}, gives back at \
+                 {gives_back:.1})",
                 pipe.balloon(),
-                BALLOON_LIMITS.0,
-                BALLOON_LIMITS.1,
             );
         }
         Mechanism::Bourdon => {

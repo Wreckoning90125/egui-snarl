@@ -7,17 +7,22 @@
 
 #![allow(missing_docs)]
 
+mod drive;
 mod flow;
 mod graph;
 mod pipe;
 #[path = "../interaction/tube.rs"]
 mod tube;
 
+use std::ops::RangeInclusive;
+
+use drive::Role;
 use eframe::App;
 use egui::{Align2, Color32, FontId, Id, Ui, vec2};
 use egui_snarl::{Snarl, ui::get_snarl_anatomy};
-use flow::Mechanism;
+use flow::{Mechanism, Params};
 use graph::{Assign, Look, Node, Viewer};
+use pipe::Ends;
 
 /// Seconds the command takes to swing from full push to full pull and back when it sweeps.
 const SWEEP_PERIOD: f64 = 14.0;
@@ -68,6 +73,15 @@ struct PipesApp {
     sweep: bool,
     paused: bool,
     reduced_motion: bool,
+
+    /// Whether the panel with every number of the models is open.
+    parameters: bool,
+}
+
+/// One number of a model, with the range it can be set in.
+fn number(ui: &mut Ui, name: &str, value: &mut f32, range: RangeInclusive<f32>, about: &str) {
+    ui.add(egui::Slider::new(value, range).text(name))
+        .on_hover_text(about);
 }
 
 impl PipesApp {
@@ -82,6 +96,7 @@ impl PipesApp {
             sweep,
             paused: false,
             reduced_motion: false,
+            parameters: false,
         }
     }
 
@@ -112,15 +127,46 @@ impl PipesApp {
             .on_hover_text("The same graph with nothing asked of its wires");
 
         ui.separator();
+        ui.label("Ends:");
+        ui.selectable_value(&mut self.viewer.style.ends, Ends::Behind, "Behind")
+            .on_hover_text("A pipe runs in behind the node it meets");
+        ui.selectable_value(&mut self.viewer.style.ends, Ends::Fittings, "Fittings")
+            .on_hover_text("A fitting sits on the front of the node at each end of a pipe");
+    }
+
+    fn drives(&mut self, ui: &mut Ui) {
+        let signal = &mut self.viewer.drives.signal;
+
+        ui.label("Signal:");
+        ui.selectable_value(&mut signal.role, Role::Pump, "pumps")
+            .on_hover_text("The signal pushes the contents");
+        ui.selectable_value(&mut signal.role, Role::Valve, "opens a valve")
+            .on_hover_text(
+                "The signal lets through what something else pushes. \
+                 With no gravity there is nothing to let through.",
+            );
         ui.add_enabled(
             !self.sweep,
-            egui::Slider::new(&mut self.viewer.command, -1.0..=1.0)
+            egui::Slider::new(&mut signal.command, -1.0..=1.0)
                 .text("command")
                 .custom_formatter(|value, _| format!("{value:+.2}")),
         )
-        .on_hover_text("How hard the sources push. Negative pulls.");
+        .on_hover_text(
+            "How hard the sources push, or how far the valves are open. Negative pulls.",
+        );
         ui.checkbox(&mut self.sweep, "Sweep")
             .on_hover_text("Swing the command slowly from full push to full pull and back");
+
+        ui.separator();
+        ui.add(
+            egui::Slider::new(&mut self.viewer.drives.gravity.strength, 0.0..=2.0).text("gravity"),
+        )
+        .on_hover_text(
+            "Pushes the contents of a pipe toward its lower end and lets the pipe sag. \
+             Zero is a pipe driven by the signal alone.",
+        );
+
+        ui.separator();
         ui.checkbox(&mut self.paused, "Pause");
         ui.checkbox(&mut self.reduced_motion, "Reduced motion")
             .on_hover_text("Hold every pipe and every bead still");
@@ -138,6 +184,283 @@ impl PipesApp {
             self.viewer.reset();
             self.viewer.fit();
         }
+        if ui
+            .toggle_value(&mut self.parameters, "Parameters")
+            .on_hover_text("Every number the models and the look use")
+            .changed()
+        {
+            self.viewer.fit();
+        }
+    }
+
+    fn parameters(&mut self, ui: &mut Ui) {
+        if ui
+            .button("Defaults")
+            .on_hover_text("Put every number below back")
+            .clicked()
+        {
+            let ends = self.viewer.style.ends;
+            self.viewer.params = Params::default();
+            self.viewer.style = pipe::Style {
+                ends,
+                ..pipe::Style::default()
+            };
+        }
+
+        let Viewer {
+            params,
+            style,
+            drives,
+            ..
+        } = &mut self.viewer;
+
+        ui.collapsing("What drives a pipe", |ui| {
+            number(
+                ui,
+                "speed",
+                &mut params.speed,
+                20.0..=400.0,
+                "Speed of the contents under a full push",
+            );
+            number(
+                ui,
+                "gravity angle",
+                &mut drives.gravity.angle,
+                -180.0..=180.0,
+                "Which way is down, in degrees clockwise from straight down the screen",
+            );
+            number(
+                ui,
+                "full drop",
+                &mut params.full_drop,
+                10.0..=400.0,
+                "The drop from inlet to outlet that, under gravity of 1, pushes as hard as a full \
+                 command",
+            );
+            number(
+                ui,
+                "sag",
+                &mut params.sag,
+                0.0..=80.0,
+                "How far the middle of a level pipe 500 long sags under gravity of 1",
+            );
+        });
+
+        ui.collapsing("Peristalsis", |ui| {
+            let rings = &mut params.peristalsis;
+            number(
+                ui,
+                "ring speed",
+                &mut rings.speed,
+                10.0..=400.0,
+                "Speed of the rings of contraction under a full push",
+            );
+            number(
+                ui,
+                "spacing",
+                &mut rings.spacing,
+                24.0..=300.0,
+                "Distance from one ring to the next",
+            );
+            number(
+                ui,
+                "ring length",
+                &mut rings.length,
+                8.0..=300.0,
+                "Length of pipe one ring narrows. What is left of the spacing stays fully open.",
+            );
+            number(
+                ui,
+                "throat",
+                &mut rings.throat,
+                0.2..=1.0,
+                "Cross-section left open in the middle of a ring",
+            );
+        });
+
+        ui.collapsing("Pressure wave", |ui| {
+            let wave = &mut params.wave;
+            number(
+                ui,
+                "wave speed",
+                &mut wave.speed,
+                60.0..=900.0,
+                "Speed at which a change of pressure runs along the wall",
+            );
+            number(
+                ui,
+                "friction",
+                &mut wave.friction,
+                0.0..=3.0,
+                "Share of the flow lost each second",
+            );
+            number(
+                ui,
+                "beats",
+                &mut wave.rate,
+                0.2..=3.0,
+                "Beats of the source each second",
+            );
+            number(
+                ui,
+                "beat share",
+                &mut wave.share,
+                0.05..=0.9,
+                "Share of a beat during which the source pushes",
+            );
+            number(
+                ui,
+                "between beats",
+                &mut wave.resting,
+                0.0..=1.0,
+                "Flow between beats, as a multiple of the speed",
+            );
+            number(
+                ui,
+                "at a beat",
+                &mut wave.pushing,
+                0.5..=3.0,
+                "Flow at the height of a beat, as a multiple of the speed",
+            );
+        });
+
+        ui.collapsing("Ballooning", |ui| {
+            let balloon = &mut params.balloon;
+            number(
+                ui,
+                "where",
+                &mut balloon.at,
+                0.1..=0.9,
+                "Where along the pipe the soft stretch is",
+            );
+            number(
+                ui,
+                "reach",
+                &mut balloon.reach,
+                8.0..=140.0,
+                "How far the soft stretch reaches to each side of its middle",
+            );
+            number(
+                ui,
+                "roundness",
+                &mut balloon.roundness,
+                1.0..=10.0,
+                "2 is a bell, pointed in the middle. Larger is flatter across the middle, toward \
+                 a sausage.",
+            );
+            number(
+                ui,
+                "threshold",
+                &mut balloon.threshold,
+                0.1..=0.95,
+                "The push above which the soft stretch gives way",
+            );
+            number(
+                ui,
+                "growth",
+                &mut balloon.growth,
+                0.2..=3.0,
+                "How much the cross-section grows for each unit of fill",
+            );
+            number(
+                ui,
+                "gives way",
+                &mut balloon.gives_way,
+                0.2..=2.0,
+                "The fill at which the wall resists most",
+            );
+            number(
+                ui,
+                "gives back",
+                &mut balloon.gives_back,
+                0.4..=4.0,
+                "The fill at which the wall resists least; it must fall to here to give back",
+            );
+        });
+
+        ui.collapsing("Bourdon flex", |ui| {
+            let bourdon = &mut params.bourdon;
+            number(
+                ui,
+                "bow",
+                &mut bourdon.bow,
+                0.0..=0.45,
+                "How far the pipe at rest bows out, as a share of the distance between its ends",
+            );
+            number(
+                ui,
+                "uncurl",
+                &mut bourdon.uncurl,
+                0.0..=1.0,
+                "How much of its curl the pipe loses under a full push",
+            );
+            number(
+                ui,
+                "curl",
+                &mut bourdon.curl,
+                0.0..=0.5,
+                "How much curl it gains when pulled on as hard",
+            );
+            number(
+                ui,
+                "quickness",
+                &mut bourdon.rate,
+                1.0..=20.0,
+                "How quickly the pipe follows the push",
+            );
+            number(
+                ui,
+                "damping",
+                &mut bourdon.damping,
+                0.1..=1.5,
+                "How strongly its swing is damped. One does not overshoot.",
+            );
+            number(
+                ui,
+                "swell",
+                &mut bourdon.swell,
+                0.0..=0.6,
+                "How much the cross-section rounds out under a full push",
+            );
+        });
+
+        ui.collapsing("Look", |ui| {
+            number(
+                ui,
+                "half width",
+                &mut style.radius,
+                4.0..=18.0,
+                "Half width of a pipe at rest",
+            );
+            number(
+                ui,
+                "wall",
+                &mut style.wall,
+                0.5..=4.0,
+                "Thickness of the wall",
+            );
+            number(
+                ui,
+                "colour length",
+                &mut style.band,
+                16.0..=512.0,
+                "Length of pipe that contents of one colour fill at rest",
+            );
+            number(
+                ui,
+                "blend",
+                &mut style.blend,
+                0.0..=1.0,
+                "How much of that length a colour takes to run into the next",
+            );
+            number(
+                ui,
+                "roundness",
+                &mut style.depth,
+                0.0..=1.0,
+                "How round the pipe is lit, from flat colour to a lit side and a highlight",
+            );
+        });
     }
 
     fn view(&mut self, look: Look, name: &str, caption: &str, ui: &mut Ui) {
@@ -180,7 +503,8 @@ impl App for PipesApp {
             let time = ui.input(|input| input.time);
             #[allow(clippy::cast_possible_truncation)]
             {
-                self.viewer.command = (std::f64::consts::TAU * time / SWEEP_PERIOD).cos() as f32;
+                self.viewer.drives.signal.command =
+                    (std::f64::consts::TAU * time / SWEEP_PERIOD).cos() as f32;
             }
         }
 
@@ -197,7 +521,17 @@ impl App for PipesApp {
 
         egui::Panel::top("controls").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| self.controls(ui));
+            ui.horizontal_wrapped(|ui| self.drives(ui));
         });
+
+        if self.parameters {
+            egui::Panel::right("parameters")
+                .resizable(false)
+                .default_size(300.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.parameters(ui));
+                });
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             let status = self.status(ui);
