@@ -18,6 +18,9 @@ const MAX_SUBDIVIDED_POINTS: usize = 1024;
 /// How much farther than its half width a wall may reach at a sharp bend.
 const MAX_MITRE: f32 = 2.0;
 
+/// The shortest run a cut leaves between itself and the next point of the cable.
+const SHORTEST_RUN: f32 = 0.05;
+
 /// A point on a cable together with the cable's direction there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CableAnchor {
@@ -298,6 +301,10 @@ impl CableGeometry {
     /// The part of this cable between two shares of its arc length, with its half widths.
     ///
     /// Shares are clamped to `0.0..=1.0` and taken in ascending order.
+    ///
+    /// A point of the cable that lies within a twentieth of a unit of either cut is left
+    /// out, and the cut stands in for it. A run that short has no direction worth the
+    /// name, and the walls of the part would turn with it.
     #[must_use]
     pub fn section(&self, from: f32, to: f32) -> Self {
         let clamp = |share: f32| {
@@ -310,11 +317,13 @@ impl CableGeometry {
         let (from, to) = (clamp(from).min(clamp(to)), clamp(from).max(clamp(to)));
         let total = self.length();
 
+        let (first, last) = (from * total + SHORTEST_RUN, to * total - SHORTEST_RUN);
+
         let mut parts = Vec::new();
         parts.push((self.anchor_at(from).pos, self.radius_at(from)));
         for (index, &point) in self.points.iter().enumerate() {
             let length = self.lengths[index];
-            if length > from * total && length < to * total {
+            if length > first && length < last {
                 parts.push((point, self.radius_of(index)));
             }
         }
@@ -1219,6 +1228,64 @@ mod tests {
         // Half widths that make no sense count as none.
         let odd = elbow().with_radii(|share| if share < 0.5 { -3.0 } else { f32::NAN });
         assert_eq!(odd.radii(), Some(&[0.0, 0.0, 0.0][..]));
+    }
+
+    #[test]
+    fn a_section_cut_beside_a_point_keeps_its_walls_beside_the_path() {
+        // A straight tube on a slant, far from the origin, with a point every three units.
+        let (from, to) = (pos2(412.0, 431.0), pos2(771.0, 566.0));
+        let tube = CableGeometry::line(from, to)
+            .subdivided(3.0)
+            .with_radii(|_| 10.0);
+        let total = tube.length();
+        let across = {
+            let along = (to - from).normalized();
+            vec2(-along.y, along.x)
+        };
+
+        // Cut it a hair to either side of one of its points, again and again. The walls
+        // of each part are ten from the line the tube runs along, at its ends as well.
+        for point_index in [7usize, 31, 64, 90] {
+            let at = tube.lengths[point_index] / total;
+            for hair in [-3e-4, -1e-4, -2e-5, 2e-5, 1e-4, 3e-4, 5e-3, 0.04] {
+                let cut = at + hair / total;
+                for section in [tube.section(0.0, cut), tube.section(cut, 1.0)] {
+                    let [near, far] = section.walls();
+                    for (index, &point) in section.points().iter().enumerate() {
+                        for (wall, side) in [(&near, -10.0), (&far, 10.0)] {
+                            let strays = wall[index].distance(point + across * side);
+                            assert!(
+                                strays < 0.01,
+                                "cut {hair} from point {point_index}: a wall strays {strays}"
+                            );
+                        }
+                    }
+
+                    // No run of the part is too short to have a direction.
+                    for pair in section.points().windows(2) {
+                        assert!(
+                            pair[0].distance(pair[1]) > 0.04,
+                            "cut {hair} from point {point_index}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The cuts themselves are where they were asked for, and what lies between them
+        // is the cable's own points.
+        let section = tube.section(0.25, 0.5);
+        assert!(section.start().distance(from + 0.25 * (to - from)) < 1e-3);
+        assert!(section.end().distance(from + 0.5 * (to - from)) < 1e-3);
+        assert!((section.length() - 0.25 * total).abs() < 1e-3);
+        for point in &section.points()[1..section.points().len() - 1] {
+            assert!(tube.points().contains(point));
+        }
+
+        // A part shorter than that is still its two cuts.
+        let sliver = tube.section(0.5, 0.5 + 0.01 / total);
+        assert_eq!(sliver.points().len(), 2);
+        assert!((sliver.length() - 0.01).abs() < 1e-3);
     }
 
     #[test]
