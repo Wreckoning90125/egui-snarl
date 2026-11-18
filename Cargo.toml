@@ -66,3 +66,7 @@ required-features = ["serde", "egui-probe"]
 name = "interaction"
 path = "examples/interaction/main.rs"
 required-features = ["serde"]
+
+[[example]]
+name = "pipes"
+path = "examples/pipes/main.rs"

@@ -103,6 +103,9 @@ painted on it. None of this is used unless a viewer calls it.
   that paints a shape is the pass that picks along it. Ask for the next frame yourself
   (`Context::request_repaint`) while something moves.
 
+`examples/pipes` uses these for five kinds of tube motion, beside the beads of this
+example. See its README.
+
 ### Replacing a tube overlay painted over the canvas
 
 `tube.rs` is `paint_energy` from `renderlab-native` (`crates/renderlab-dx12/src/paint_graph.rs`
