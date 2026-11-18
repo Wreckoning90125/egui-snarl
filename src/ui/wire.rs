@@ -932,24 +932,18 @@ impl WirePaint {
             return;
         }
 
-        let reach = self.widest().max(1.0) * 0.5;
-        if !geometry.bounds().expand(reach).intersects(clip_rect) {
+        if !geometry
+            .bounds()
+            .expand(self.widest() * 0.5)
+            .intersects(clip_rect)
+        {
             return;
         }
 
         for &stroke in &self.strokes {
-            let mut stroke = stroke;
-            if !(stroke.width > 0.0) || stroke.color == Color32::TRANSPARENT {
-                continue;
+            if stroke.width > 0.0 && stroke.color != Color32::TRANSPARENT {
+                shapes.push(geometry.stroke(stroke));
             }
-
-            // Hairlines keep one unit of width and fade instead of vanishing.
-            if stroke.width < 1.0 {
-                stroke.color = stroke.color.gamma_multiply(stroke.width);
-                stroke.width = 1.0;
-            }
-
-            shapes.push(geometry.stroke(stroke));
         }
     }
 }
@@ -1083,11 +1077,16 @@ mod tests {
         WirePaint::solid((2.0, Color32::TRANSPARENT)).paint(&cable, Rect::EVERYTHING, &mut shapes);
         assert!(shapes.is_empty());
 
-        // Hairlines keep one unit of width and fade instead.
+        // A stroke thinner than one graph unit keeps the width it was given: it may be several
+        // points wide on screen in a magnified view. egui fades what is thinner than a pixel.
         WirePaint::solid((0.5, Color32::WHITE)).paint(&cable, Rect::EVERYTHING, &mut shapes);
         let [Shape::Path(path)] = shapes.as_slice() else {
             panic!("expected one path");
         };
-        assert_eq!(path.stroke.width.to_bits(), 1.0f32.to_bits());
+        assert_eq!(path.stroke.width.to_bits(), 0.5f32.to_bits());
+        assert_eq!(
+            path.stroke.color,
+            egui::epaint::ColorMode::Solid(Color32::WHITE)
+        );
     }
 }
