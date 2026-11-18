@@ -252,7 +252,8 @@ pub trait SnarlViewer<T> {
     ///
     /// `default` is one stroke of the mixed pin colour, half again as wide while the wire is
     /// hovered or selected. Return it to keep that look, or build a [`WirePaint`] from layered
-    /// strokes: a casing, a core, a glow. Return [`WirePaint::hidden`] to paint the wire yourself.
+    /// strokes: a casing, a core, a glow. Discs added with [`WirePaint::with_bead`] ride on the
+    /// same path. Return [`WirePaint::hidden`] to paint the wire yourself.
     ///
     /// Called once for every visible wire on every pass with `wire.hovered` false to learn how
     /// wide the wire is, and once more for the wire the pointer turns out to be on.

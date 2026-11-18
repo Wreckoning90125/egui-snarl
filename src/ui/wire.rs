@@ -825,7 +825,21 @@ pub fn cached_default_route(ctx: &Context, wire: WireId, route: &WireRoute) -> A
     })
 }
 
-/// How one wire is painted: strokes laid back to front along the wire's one path.
+/// A filled disc that rides on a wire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WireBead {
+    /// Fraction of the wire's arc length the disc is centred at, in `0.0..=1.0`.
+    pub share: f32,
+
+    /// Radius of the disc, in graph coordinates.
+    pub radius: f32,
+
+    /// Colour the disc is filled with.
+    pub fill: Color32,
+}
+
+/// How one wire is painted: strokes laid back to front along the wire's one path, then discs
+/// placed on it.
 ///
 /// The path is the same [`CableGeometry`] the wire is hit tested with, so a wire drawn as a
 /// wide glowing tube is still picked along exactly the curve the eye sees.
@@ -833,6 +847,7 @@ pub fn cached_default_route(ctx: &Context, wire: WireId, route: &WireRoute) -> A
 #[derive(Clone, Debug, PartialEq)]
 pub struct WirePaint {
     strokes: SmallVec<[Stroke; 4]>,
+    beads: SmallVec<[WireBead; 4]>,
     hit_width: f32,
 }
 
@@ -843,6 +858,7 @@ impl WirePaint {
         let stroke = stroke.into();
         Self {
             strokes: smallvec::smallvec![stroke],
+            beads: SmallVec::new(),
             hit_width: stroke.width,
         }
     }
@@ -855,6 +871,7 @@ impl WirePaint {
     pub fn hidden() -> Self {
         Self {
             strokes: SmallVec::new(),
+            beads: SmallVec::new(),
             hit_width: 0.0,
         }
     }
@@ -895,9 +912,25 @@ impl WirePaint {
         self
     }
 
+    /// Adds a filled disc of `radius` centred on the wire, `share` of the way along its length.
+    ///
+    /// Discs are painted in front of the wire's strokes, in the order they were added. The
+    /// view places each one on the path it paints and hit tests, whatever route that is, so a
+    /// viewer animates a disc by giving a different `share` on each pass.
+    #[must_use]
+    pub fn with_bead(mut self, share: f32, radius: f32, fill: Color32) -> Self {
+        self.beads.push(WireBead {
+            share,
+            radius,
+            fill,
+        });
+        self
+    }
+
     /// Sets the width of the band in which the pointer counts as being on the wire.
     ///
-    /// Defaults to the width of the stroke given to [`WirePaint::solid`]. A glow does not widen it.
+    /// Defaults to the width of the stroke given to [`WirePaint::solid`]. A glow does not widen it,
+    /// and neither does a bead.
     /// The view never picks more narrowly than [`SnarlStyle::wire_hit_tolerance`](super::SnarlStyle::wire_hit_tolerance).
     #[must_use]
     pub const fn with_hit_width(mut self, width: f32) -> Self {
@@ -910,6 +943,13 @@ impl WirePaint {
     #[inline]
     pub fn strokes(&self) -> &[Stroke] {
         &self.strokes
+    }
+
+    /// Discs placed on the wire, back to front.
+    #[must_use]
+    #[inline]
+    pub fn beads(&self) -> &[WireBead] {
+        &self.beads
     }
 
     /// Width of the band in which the pointer counts as being on the wire.
@@ -928,23 +968,29 @@ impl WirePaint {
 
     /// Appends the shapes that paint `geometry` this way, unless it lies outside `clip_rect`.
     pub fn paint(&self, geometry: &CableGeometry, clip_rect: Rect, shapes: &mut Vec<Shape>) {
-        if self.strokes.is_empty() {
+        let strokes = self
+            .strokes
+            .iter()
+            .filter(|stroke| stroke.width > 0.0 && stroke.color != Color32::TRANSPARENT);
+
+        let beads = self
+            .beads
+            .iter()
+            .filter(|bead| bead.radius > 0.0 && bead.fill != Color32::TRANSPARENT);
+
+        let reach = beads
+            .clone()
+            .map(|bead| bead.radius)
+            .fold(self.widest() * 0.5, f32::max);
+
+        if !geometry.bounds().expand(reach).intersects(clip_rect) {
             return;
         }
 
-        if !geometry
-            .bounds()
-            .expand(self.widest() * 0.5)
-            .intersects(clip_rect)
-        {
-            return;
-        }
-
-        for &stroke in &self.strokes {
-            if stroke.width > 0.0 && stroke.color != Color32::TRANSPARENT {
-                shapes.push(geometry.stroke(stroke));
-            }
-        }
+        shapes.extend(strokes.map(|&stroke| geometry.stroke(stroke)));
+        shapes.extend(beads.map(|bead| {
+            Shape::circle_filled(geometry.anchor_at(bead.share).pos, bead.radius, bead.fill)
+        }));
     }
 }
 
@@ -1060,6 +1106,61 @@ mod tests {
         for &point in cable.points() {
             assert!(cable.hit(point, 0.0).is_some());
         }
+    }
+
+    #[test]
+    fn beads_are_placed_on_the_painted_path() {
+        let cable = route(WireStyle::Bezier5).default_route();
+        let paint = WirePaint::solid((3.0, Color32::WHITE))
+            .with_bead(0.0, 4.0, Color32::RED)
+            .with_bead(0.4, 5.0, Color32::GREEN)
+            .with_bead(2.0, 6.0, Color32::BLUE)
+            .with_bead(0.5, 0.0, Color32::RED)
+            .with_bead(0.5, 3.0, Color32::TRANSPARENT);
+
+        assert_eq!(paint.beads().len(), 5);
+        assert_eq!(paint.hit_width().to_bits(), 3.0f32.to_bits());
+
+        let mut shapes = Vec::new();
+        paint.paint(&cable, Rect::EVERYTHING, &mut shapes);
+
+        // The stroke first, then the three discs that have a size and a colour.
+        let [Shape::Path(_), discs @ ..] = shapes.as_slice() else {
+            panic!("the stroke is painted first, got {shapes:?}");
+        };
+        assert_eq!(discs.len(), 3);
+
+        for (disc, (share, radius, fill)) in discs.iter().zip([
+            (0.0, 4.0f32, Color32::RED),
+            (0.4, 5.0, Color32::GREEN),
+            (1.0, 6.0, Color32::BLUE),
+        ]) {
+            let Shape::Circle(disc) = disc else {
+                panic!("a bead is a disc, got {disc:?}");
+            };
+            assert_eq!(disc.center, cable.anchor_at(share).pos);
+            assert!(cable.hit(disc.center, 1e-3).is_some());
+            assert_eq!(disc.radius.to_bits(), radius.to_bits());
+            assert_eq!(disc.fill, fill);
+        }
+
+        // A wire may be nothing but beads.
+        let mut shapes = Vec::new();
+        WirePaint::hidden().with_bead(0.5, 4.0, Color32::RED).paint(
+            &cable,
+            Rect::EVERYTHING,
+            &mut shapes,
+        );
+        assert!(matches!(shapes.as_slice(), [Shape::Circle(_)]));
+
+        // A bead that reaches into the clip rectangle is painted even when the path stops
+        // short of it.
+        let past_the_end = Rect::from_min_size(cable.end() + vec2(3.0, -40.0), vec2(50.0, 80.0));
+        let mut shapes = Vec::new();
+        WirePaint::solid((3.0, Color32::WHITE)).paint(&cable, past_the_end, &mut shapes);
+        assert!(shapes.is_empty());
+        paint.paint(&cable, past_the_end, &mut shapes);
+        assert_eq!(shapes.len(), 4);
     }
 
     #[test]

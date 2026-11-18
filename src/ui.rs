@@ -44,7 +44,7 @@ pub use self::{
     pin::{AnyPin, AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
     state::{get_selected_nodes, get_selected_wire, set_selected_wire, update_selected_nodes},
     viewer::SnarlViewer,
-    wire::{WireLayer, WirePaint, WirePins, WireRoute, WireStyle},
+    wire::{WireBead, WireLayer, WirePaint, WirePins, WireRoute, WireStyle},
 };
 
 /// Controls how header, pins, body and footer are placed in the node.

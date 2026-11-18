@@ -20,6 +20,10 @@ const OUTER: &str = "outer";
 const INNER: &str = "inner";
 const INNER_SIZE: Vec2 = vec2(260.0, 170.0);
 
+/// A colour no pin is drawn in.
+const BEAD: Color32 = Color32::from_rgb(250, 240, 20);
+const BEAD_RADIUS: f32 = 5.0;
+
 fn view(name: &str) -> Id {
     Id::unique(name)
 }
@@ -56,6 +60,9 @@ struct Viewer {
 
     /// Length, in screen points, of the straight lead the route leaves each pin with.
     screen_lead: Option<f32>,
+
+    /// Where along every wire a disc is placed, as shares of its length.
+    beads: Vec<f32>,
     wire_menu: bool,
     graph_menu: bool,
 
@@ -190,11 +197,15 @@ impl SnarlViewer<Node> for Viewer {
         default: WirePaint,
         _snarl: &Snarl<Node>,
     ) -> WirePaint {
-        if self.glow {
+        let paint = if self.glow {
             WirePaint::solid((6.0, wire.color)).with_glow(Color32::from_rgb(255, 140, 60), 8.0)
         } else {
             default
-        }
+        };
+
+        self.beads.iter().fold(paint, |paint, &share| {
+            paint.with_bead(share, BEAD_RADIUS, BEAD)
+        })
     }
 
     fn wire_action(&mut self, action: &WireAction, _ui: &mut Ui, snarl: &mut Snarl<Node>) {
@@ -519,6 +530,40 @@ fn open_paths(shape: &Shape, paths: &mut Vec<Vec<Pos2>>) {
     }
 }
 
+/// Every shape in the output, in the order it is painted, with groups taken apart.
+fn painted(output: &FullOutput) -> Vec<&Shape> {
+    fn take_apart<'a>(shape: &'a Shape, shapes: &mut Vec<&'a Shape>) {
+        match shape {
+            Shape::Vec(group) => {
+                for shape in group {
+                    take_apart(shape, shapes);
+                }
+            }
+            Shape::Noop => {}
+            shape => shapes.push(shape),
+        }
+    }
+
+    let mut shapes = Vec::new();
+    for clipped in &output.shapes {
+        take_apart(&clipped.shape, &mut shapes);
+    }
+    shapes
+}
+
+/// Where in paint order the first open path through exactly `points` comes.
+fn first_painted_along(shapes: &[&Shape], points: &[Pos2]) -> Option<usize> {
+    shapes.iter().position(|shape| {
+        matches!(shape, Shape::Path(path) if !path.closed
+            && path.points.len() == points.len()
+            && path
+                .points
+                .iter()
+                .zip(points)
+                .all(|(painted, expected)| painted.distance(*expected) < 0.05))
+    })
+}
+
 /// How many open paths in the output run through exactly `points`.
 fn painted_along(output: &FullOutput, points: &[Pos2]) -> usize {
     let mut paths = Vec::new();
@@ -689,6 +734,73 @@ fn a_route_can_keep_a_length_on_screen_at_every_zoom() {
         scales[1] < 0.75 && scales[2] > 1.25,
         "the view was zoomed out and in: {scales:?}"
     );
+}
+
+#[test]
+fn beads_ride_on_the_path_a_wire_is_painted_and_picked_along() {
+    const SHARES: [f32; 3] = [0.0, 0.4, 1.0];
+
+    for custom_route in [false, true] {
+        let (snarl, wire) = pair(true);
+        let mut world = World::new(
+            snarl,
+            Viewer {
+                beads: SHARES.to_vec(),
+                custom_route,
+                ..Viewer::default()
+            },
+        );
+
+        for zoom in [1.0, 0.3, 2.5] {
+            let spot = empty_spot(&world.outer());
+            world.zoom_at(spot, zoom);
+            world.move_to(spot);
+
+            let output = world.settle();
+            let anatomy = world.outer();
+            let scale = anatomy.transform.scale();
+            let measured = anatomy.wire(wire).expect("the wire was measured");
+            let on_screen = measured.geometry.transformed(anatomy.transform.to_global);
+            assert_eq!(measured.paint.beads().len(), SHARES.len());
+
+            let shapes = painted(&output);
+            let discs: Vec<(usize, &egui::epaint::CircleShape)> = shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, shape)| match shape {
+                    Shape::Circle(disc) if disc.fill == BEAD => Some((index, disc)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(discs.len(), SHARES.len(), "scale {scale}");
+
+            let stroke = first_painted_along(&shapes, on_screen.points())
+                .expect("the wire's stroke was painted");
+
+            for (&(index, disc), share) in discs.iter().zip(SHARES) {
+                assert_close(
+                    disc.center,
+                    on_screen.anchor_at(share).pos,
+                    0.02,
+                    "bead centre",
+                );
+                assert!(
+                    (disc.radius - BEAD_RADIUS * scale).abs() < 1e-3,
+                    "bead radius {} at scale {scale}",
+                    disc.radius
+                );
+                assert!(index > stroke, "a bead is painted in front of its wire");
+            }
+
+            // The middle bead sits where the pointer picks the wire.
+            world.move_to(discs[1].1.center);
+            assert_eq!(
+                world.outer().hovered_wire().map(|wire| wire.pins),
+                Some(wire),
+                "custom route {custom_route}, scale {scale}"
+            );
+        }
+    }
 }
 
 #[test]
