@@ -302,8 +302,8 @@ impl CableGeometry {
             if distance_sq < best_distance_sq {
                 best_distance_sq = distance_sq;
                 best_pos = nearest;
-                best_length =
-                    (self.lengths[index] - self.lengths[index - 1]).mul_add(t, self.lengths[index - 1]);
+                best_length = (self.lengths[index] - self.lengths[index - 1])
+                    .mul_add(t, self.lengths[index - 1]);
             }
         }
 

@@ -10,8 +10,8 @@ use egui_snarl::{
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
     ui::{
         AnyPin, CableGeometry, InsertionAnchor, PinInfo, SnarlAnatomy, SnarlPin, SnarlStyle,
-        SnarlViewer, SnarlWidget, WireAction, WirePaint, WirePins, WireRoute, WireTrigger, WireView, get_selected_nodes, get_selected_wire, get_snarl_anatomy,
-        set_selected_wire,
+        SnarlViewer, SnarlWidget, WireAction, WirePaint, WirePins, WireRoute, WireTrigger,
+        WireView, get_selected_nodes, get_selected_wire, get_snarl_anatomy, set_selected_wire,
     },
 };
 
@@ -592,7 +592,11 @@ fn a_wire_is_painted_and_hit_tested_along_one_path_at_every_zoom() {
             assert_close(on_screen.start(), from.screen_center, 0.01, "wire start");
 
             if custom_route {
-                assert_eq!(measured.geometry.points().len(), 3, "the viewer's route is used");
+                assert_eq!(
+                    measured.geometry.points().len(),
+                    3,
+                    "the viewer's route is used"
+                );
             }
 
             // Every stroke of the theme lies along the measured path, and nothing else does.
@@ -606,7 +610,11 @@ fn a_wire_is_painted_and_hit_tested_along_one_path_at_every_zoom() {
 
             // The pointer picks the wire within the same band of screen points at every zoom.
             let band = measured.hit_tolerance * anatomy.transform.scale();
-            let expected_band = if glow { 6.0f32.max(3.0 * anatomy.transform.scale()) } else { 6.0 };
+            let expected_band = if glow {
+                6.0f32.max(3.0 * anatomy.transform.scale())
+            } else {
+                6.0
+            };
             assert!((band - expected_band).abs() < 1e-3, "band {band}");
 
             let middle = on_screen.midpoint();
@@ -656,7 +664,11 @@ fn a_row_that_resizes_carries_its_pin_in_the_same_pass() {
 
     // The pin sits on the row as measured in this very pass...
     assert!((first_resized.graph_center.y - first_resized.row_rect.center().y).abs() < 1e-3);
-    assert!(first_resized.graph_rect.contains(first_resized.graph_center));
+    assert!(
+        first_resized
+            .graph_rect
+            .contains(first_resized.graph_center)
+    );
 
     // ...which is not where the height remembered from the last pass would have put it.
     assert!(first_resized.graph_center.y - first_before.graph_center.y > 8.0);
@@ -816,7 +828,11 @@ fn a_view_inside_a_node_owns_its_pan_zoom_and_wires() {
 
     // ...and is clipped to the node that holds it.
     let group_rect = outer.node(group).unwrap().screen_rect;
-    assert!(group_rect.expand(0.5).contains_rect(inner.transform.global_clip_rect));
+    assert!(
+        group_rect
+            .expand(0.5)
+            .contains_rect(inner.transform.global_clip_rect)
+    );
     assert!(
         (inner.transform.global_ui_rect.size() - INNER_SIZE * outer.transform.scale()).length()
             < 20.0
@@ -832,8 +848,18 @@ fn a_view_inside_a_node_owns_its_pan_zoom_and_wires() {
                 .values()
                 .chain(anatomy.output_pins.values())
                 .map(|pin| pin.widget_id)
-                .chain(anatomy.nodes.iter().map(|node| anatomy.view_ids.node_id(node.id)))
-                .chain(anatomy.wires.iter().map(|wire| anatomy.view_ids.wire_id(wire.pins)))
+                .chain(
+                    anatomy
+                        .nodes
+                        .iter()
+                        .map(|node| anatomy.view_ids.node_id(node.id)),
+                )
+                .chain(
+                    anatomy
+                        .wires
+                        .iter()
+                        .map(|wire| anatomy.view_ids.wire_id(wire.pins)),
+                )
         })
         .collect();
     let total = ids.len();
@@ -882,7 +908,10 @@ fn a_view_inside_a_node_owns_its_pan_zoom_and_wires() {
         "panned by {panned:?}"
     );
     assert!(world.viewer.moved.is_empty(), "the group node stayed put");
-    assert_eq!(world.snarl.get_node_info(group).unwrap().pos, pos2(0.0, 0.0));
+    assert_eq!(
+        world.snarl.get_node_info(group).unwrap().pos,
+        pos2(0.0, 0.0)
+    );
 
     // Zooming with the pointer over the outer canvas zooms the outer view only.
     let outside = empty_spot(&outer_panned);
@@ -928,7 +957,10 @@ fn a_view_inside_a_node_owns_its_pan_zoom_and_wires() {
     let inner_viewer = world.viewer.inner.as_ref().unwrap();
     assert_eq!(inner_viewer.disconnects, 1);
     assert_eq!(inner_viewer.actions[0].wire, inner_wire);
-    assert_eq!(world.snarl[group].inner.as_ref().unwrap().wires().count(), 0);
+    assert_eq!(
+        world.snarl[group].inner.as_ref().unwrap().wires().count(),
+        0
+    );
     assert_eq!(world.viewer.disconnects, 0);
     assert!(world.viewer.actions.is_empty());
     assert_eq!(world.wires(), vec![outer_wire]);
@@ -977,7 +1009,15 @@ fn reconnect_select_move_and_zoom_keep_working_beside_wire_actions() {
     // The action says where on the wire it happened.
     let anatomy = world.outer();
     let reported = world.viewer.actions[0].anchor.pos;
-    assert!(anatomy.wire(wire).unwrap().geometry.closest(reported).distance < 1e-3);
+    assert!(
+        anatomy
+            .wire(wire)
+            .unwrap()
+            .geometry
+            .closest(reported)
+            .distance
+            < 1e-3
+    );
     assert_close(
         world.viewer.actions[0].insertion.screen_pos,
         on_wire(&world),
@@ -1008,10 +1048,23 @@ fn reconnect_select_move_and_zoom_keep_working_beside_wire_actions() {
     assert_eq!(world.wires(), vec![wire]);
     assert_eq!(world.viewer.actions.len(), 3, "the menu took the click");
 
-    let (menu_wire, anchor) = *world.viewer.wire_menu_anchors.first().expect("the menu opened");
+    let (menu_wire, anchor) = *world
+        .viewer
+        .wire_menu_anchors
+        .first()
+        .expect("the menu opened");
     assert_eq!(menu_wire, wire);
     assert_close(anchor.screen_pos, clicked, 1.0, "wire menu anchor");
-    assert!(world.outer().wire(wire).unwrap().geometry.closest(anchor.graph_pos).distance < 1e-3);
+    assert!(
+        world
+            .outer()
+            .wire(wire)
+            .unwrap()
+            .geometry
+            .closest(anchor.graph_pos)
+            .distance
+            < 1e-3
+    );
     assert_eq!(world.outer().active_insertion_anchor, Some(anchor));
 
     // The anchor stays where the menu was opened while the pointer wanders off.
@@ -1059,8 +1112,17 @@ fn reconnect_select_move_and_zoom_keep_working_beside_wire_actions() {
     let scale = world.outer().transform.scale();
     let after = world.snarl.get_node_info(sink).unwrap().pos;
     assert_close(after, before + drag / scale, 1.0, "node position");
-    assert!(world.viewer.moved.iter().all(|(nodes, _, _)| nodes == &[sink]));
-    assert!(world.viewer.moved.last().unwrap().2, "the move was reported as finished");
+    assert!(
+        world
+            .viewer
+            .moved
+            .iter()
+            .all(|(nodes, _, _)| nodes == &[sink])
+    );
+    assert!(
+        world.viewer.moved.last().unwrap().2,
+        "the move was reported as finished"
+    );
     let anatomy = world.outer();
     assert_eq!(
         anatomy.wire(wire).unwrap().geometry.end(),
@@ -1087,7 +1149,11 @@ fn reconnect_select_move_and_zoom_keep_working_beside_wire_actions() {
     world.zoom_at(empty_spot(&world.outer()), 0.75);
     let anatomy = world.outer();
     assert!((anatomy.transform.scale() - before * 0.75).abs() < 1e-3);
-    for pin in anatomy.input_pins.values().chain(anatomy.output_pins.values()) {
+    for pin in anatomy
+        .input_pins
+        .values()
+        .chain(anatomy.output_pins.values())
+    {
         assert_close(
             pin.screen_center,
             anatomy.transform.to_global * pin.graph_center,
@@ -1153,7 +1219,11 @@ fn a_finger_held_on_a_wire_acts_on_it_and_a_finger_dragged_still_pans() {
     world.long_press(held);
 
     assert_eq!(world.viewer.actions.len(), 1, "the menu took the hold");
-    let (menu_wire, anchor) = *world.viewer.wire_menu_anchors.first().expect("the menu opened");
+    let (menu_wire, anchor) = *world
+        .viewer
+        .wire_menu_anchors
+        .first()
+        .expect("the menu opened");
     assert_eq!(menu_wire, wire);
     assert_close(anchor.screen_pos, held, 1.0, "wire menu anchor");
     assert_eq!(world.wires(), vec![wire]);
@@ -1227,7 +1297,11 @@ fn the_graph_menu_inserts_where_it_was_opened_even_when_the_popup_is_moved() {
 
     let anatomy = world.outer();
     let expected = anatomy.transform.from_global * clicked;
-    let corner = *world.viewer.graph_menu_popup_corners.last().expect("the menu opened");
+    let corner = *world
+        .viewer
+        .graph_menu_popup_corners
+        .last()
+        .expect("the menu opened");
 
     assert!(
         clicked.x - corner.x > 150.0 && clicked.y - corner.y > 100.0,
@@ -1240,7 +1314,9 @@ fn the_graph_menu_inserts_where_it_was_opened_even_when_the_popup_is_moved() {
         "insertion point",
     );
     assert_eq!(
-        anatomy.active_insertion_anchor.map(|anchor| anchor.graph_pos),
+        anatomy
+            .active_insertion_anchor
+            .map(|anchor| anchor.graph_pos),
         world.viewer.graph_menu_positions.last().copied()
     );
 
@@ -1251,9 +1327,17 @@ fn the_graph_menu_inserts_where_it_was_opened_even_when_the_popup_is_moved() {
     world.move_to(pos2(300.0, 500.0));
     let _ = world.settle();
 
-    assert!(world.viewer.graph_menu_positions.len() > shown + 5, "the menu stayed open");
+    assert!(
+        world.viewer.graph_menu_positions.len() > shown + 5,
+        "the menu stayed open"
+    );
     for &pos in &world.viewer.graph_menu_positions {
-        assert_close(pos, expected, 1e-2, "insertion point while the menu is open");
+        assert_close(
+            pos,
+            expected,
+            1e-2,
+            "insertion point while the menu is open",
+        );
     }
 }
 
@@ -1281,7 +1365,12 @@ fn collapsing_a_group_keeps_its_wires_and_the_graph_inside_it() {
     let closed_pin = *closed.out_pin(outer_wire.out_pin).unwrap();
     assert_eq!(closed_pin.widget_id, open_pin.widget_id);
     assert_eq!(closed_pin.pin, open_pin.pin);
-    assert!(closed_node.final_rect.expand(12.0).contains(closed_pin.graph_center));
+    assert!(
+        closed_node
+            .final_rect
+            .expand(12.0)
+            .contains(closed_pin.graph_center)
+    );
 
     let wire = closed.wire(outer_wire).expect("the wire is still shown");
     assert_eq!(wire.geometry.start(), closed_pin.graph_center);
@@ -1306,7 +1395,12 @@ fn collapsing_a_group_keeps_its_wires_and_the_graph_inside_it() {
     let reopened = world.outer();
     let reopened_pin = *reopened.out_pin(outer_wire.out_pin).unwrap();
     assert_eq!(reopened_pin.widget_id, open_pin.widget_id);
-    assert_close(reopened_pin.graph_center, open_pin.graph_center, 0.5, "pin after reopening");
+    assert_close(
+        reopened_pin.graph_center,
+        open_pin.graph_center,
+        0.5,
+        "pin after reopening",
+    );
     assert_eq!(world.wires(), vec![outer_wire]);
     assert!(world.inner().wire(inner_wire).is_some());
     assert!(!world.viewer.inner.as_ref().unwrap().passes.is_empty());
@@ -1337,13 +1431,19 @@ fn a_saved_graph_comes_back_with_the_same_endpoints() {
     let loaded: Snarl<Node> = serde_json::from_str(&saved).unwrap();
 
     assert_eq!(endpoints(&loaded), endpoints(&snarl));
-    assert_eq!(endpoints(&loaded), vec![(outer_wire.out_pin, outer_wire.in_pin)]);
+    assert_eq!(
+        endpoints(&loaded),
+        vec![(outer_wire.out_pin, outer_wire.in_pin)]
+    );
     assert_eq!(layout(&loaded), layout(&snarl));
     assert!(!loaded.get_node_info(group).unwrap().open);
 
     let inner = loaded[group].inner.as_ref().unwrap();
     let inner_before = snarl[group].inner.as_ref().unwrap();
-    assert_eq!(endpoints(inner), vec![(inner_wire.out_pin, inner_wire.in_pin)]);
+    assert_eq!(
+        endpoints(inner),
+        vec![(inner_wire.out_pin, inner_wire.in_pin)]
+    );
     assert_eq!(layout(inner), layout(inner_before));
 
     // Saving what was loaded gives the same document: nothing the view measured leaks into it.

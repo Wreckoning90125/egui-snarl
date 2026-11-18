@@ -379,7 +379,10 @@ impl WireTrigger {
     #[must_use]
     #[inline]
     pub const fn asks_for_menu(self) -> bool {
-        matches!(self, Self::SecondaryClick | Self::LongTouch | Self::Activate)
+        matches!(
+            self,
+            Self::SecondaryClick | Self::LongTouch | Self::Activate
+        )
     }
 }
 

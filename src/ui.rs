@@ -4,8 +4,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use egui::{
     Align, Color32, CornerRadius, Frame, Id, IdSalt, Key, Layout, Margin, Modifiers, PointerButton,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind,
-    UiStackInfo, Vec2,
+    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo,
+    Vec2,
     collapsing_header::paint_default_icon,
     emath::{GuiRounding, TSTransform},
     epaint::Shadow,
