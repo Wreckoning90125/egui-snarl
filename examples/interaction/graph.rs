@@ -13,6 +13,9 @@ use egui_snarl::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "tube.rs"]
+pub mod tube;
+
 /// The fixture the example starts from.
 pub const FIXTURE: &str = include_str!("fixture.json");
 
@@ -21,6 +24,9 @@ pub const EMBEDDED_VIEW_SIZE: Vec2 = vec2(340.0, 200.0);
 
 const SIGNAL: Color32 = Color32::from_rgb(64, 196, 178);
 const CONTROL: Color32 = Color32::from_rgb(240, 170, 60);
+
+/// The colour of the tubes that run into a sink.
+pub const SINK_TUBE: [f32; 3] = [0.93, 0.67, 0.83];
 
 /// What a pin carries. It decides the pin's colour and size, nothing else.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,6 +155,11 @@ pub struct Settings {
 
     /// Show a handle on the middle of every wire.
     pub midpoint_handles: bool,
+
+    /// Paint the wires that run into a sink as tubes with pulses travelling along them,
+    /// above the nodes. See `tube.rs`.
+    #[serde(default)]
+    pub pulses: bool,
 }
 
 /// The saved state of the example.
@@ -305,6 +316,7 @@ impl Document {
                 hit_tolerance: 9.0,
                 routing: Routing::Default,
                 midpoint_handles: false,
+                pulses: false,
             },
             graph,
         }
@@ -430,6 +442,9 @@ pub struct Viewer {
 
     /// Passes left in which every view is asked to frame all of its nodes.
     fit_passes: u8,
+
+    /// The time of the pass being shown, in seconds, for what moves along the wires.
+    time: f32,
 }
 
 impl Viewer {
@@ -444,6 +459,7 @@ impl Viewer {
             palette_was_open: false,
             palette_shown: false,
             fit_passes: 0,
+            time: 0.0,
         }
     }
 
@@ -458,11 +474,25 @@ impl Viewer {
         self.fit_passes > 0
     }
 
-    /// Call once per pass before showing the graph.
-    pub fn begin_pass(&mut self) {
+    /// Call once per pass before showing the graph, with the time of the pass in seconds.
+    pub fn begin_pass(&mut self, time: f64) {
         self.palette_was_open = self.palette_shown;
         self.palette_shown = false;
         self.fit_passes = self.fit_passes.saturating_sub(1);
+
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.time = time as f32;
+        }
+    }
+
+    /// The colour of the tube a wire is painted as, for the wires that are.
+    ///
+    /// This is the one place that looks at what a wire means: only a wire that ends in a sink
+    /// is a tube. The view is told nothing of it.
+    fn tube(&self, wire: Option<WirePins>, snarl: &Snarl<Block>) -> Option<[f32; 3]> {
+        let wire = wire.filter(|_| self.settings.pulses)?;
+        matches!(snarl[wire.in_pin.node], Block::Sink { .. }).then_some(SINK_TUBE)
     }
 
     fn place(&self) -> &'static str {
@@ -641,7 +671,11 @@ impl SnarlViewer<Block> for Viewer {
         self.depth -= 1;
     }
 
-    fn wire_route(&mut self, route: &WireRoute, _snarl: &Snarl<Block>) -> Option<CableGeometry> {
+    fn wire_route(&mut self, route: &WireRoute, snarl: &Snarl<Block>) -> Option<CableGeometry> {
+        if self.tube(route.pins, snarl).is_some() {
+            return Some(tube::route(route));
+        }
+
         (self.settings.routing == Routing::Arc).then(|| {
             let span = route.to - route.from;
             let middle = route.from + span * 0.5;
@@ -657,8 +691,21 @@ impl SnarlViewer<Block> for Viewer {
         &mut self,
         wire: &WireView<'_>,
         default: WirePaint,
-        _snarl: &Snarl<Block>,
+        snarl: &Snarl<Block>,
     ) -> WirePaint {
+        if let Some(colour) = self.tube(wire.pins, snarl) {
+            let time = (!self.settings.reduced_motion).then_some(self.time);
+            let paint = tube::paint(wire, colour, time);
+
+            // Something the product's painter could not show: the tube is the wire, so it
+            // can be pointed at and selected.
+            return if wire.hovered || wire.selected {
+                paint.over(Stroke::new(1.5 / wire.scale, Color32::WHITE))
+            } else {
+                paint
+            };
+        }
+
         if !self.settings.glow {
             return default;
         }
@@ -881,7 +928,7 @@ impl SnarlViewer<Block> for Viewer {
 /// Shows the example graph in `ui`, filling what is left of it.
 pub fn show(document: &mut Document, viewer: &mut Viewer, ui: &mut Ui) -> Rect {
     viewer.settings = document.settings;
-    viewer.begin_pass();
+    viewer.begin_pass(ui.input(|input| input.time));
 
     ui.style_mut().animation_time = if document.settings.reduced_motion {
         0.0
@@ -892,7 +939,10 @@ pub fn show(document: &mut Document, viewer: &mut Viewer, ui: &mut Ui) -> Rect {
     // Titles and port names are handles for dragging a node, not text to select.
     ui.style_mut().interaction.selectable_labels = false;
 
-    if viewer.is_fitting() {
+    // Pulses move with time, not with input, so they need a pass of their own.
+    let pulsing = document.settings.pulses && !document.settings.reduced_motion;
+
+    if viewer.is_fitting() || pulsing {
         ui.ctx().request_repaint();
     }
 

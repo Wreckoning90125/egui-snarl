@@ -125,6 +125,9 @@ impl InteractionApp {
 
         ui.checkbox(&mut settings.midpoint_handles, "Handles")
             .on_hover_text("Show a handle on the middle of every wire");
+        ui.checkbox(&mut settings.pulses, "Pulses").on_hover_text(
+            "Paint the wires into an output as tubes with travelling pulses, above the nodes",
+        );
     }
 
     fn files(&mut self, ui: &mut Ui) {
@@ -250,6 +253,7 @@ impl InteractionApp {
             "Collapse the Voice node: its wires stay on the same ports.",
             "Right-click the canvas near an edge: the mark stays where you clicked.",
             "Type in the Note: its row grows and the pins follow in the same frame.",
+            "Tick Pulses: the wires into an output become tubes that can still be picked.",
         ] {
             ui.label(format!("• {line}"));
         }

@@ -274,6 +274,7 @@
     "glow": true,
     "hit_tolerance": 9.0,
     "midpoint_handles": false,
+    "pulses": false,
     "reduced_motion": false,
     "routing": "Default",
     "slack": 0.0625,
