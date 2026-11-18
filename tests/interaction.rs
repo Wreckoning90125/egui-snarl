@@ -10,8 +10,9 @@ use egui_snarl::{
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
     ui::{
         AnyPin, CableGeometry, InsertionAnchor, PinInfo, SnarlAnatomy, SnarlPin, SnarlStyle,
-        SnarlViewer, SnarlWidget, WireAction, WirePaint, WirePins, WireRoute, WireTrigger,
-        WireView, get_selected_nodes, get_selected_wire, get_snarl_anatomy, set_selected_wire,
+        SnarlViewer, SnarlWidget, WireAction, WireLayer, WirePaint, WirePins, WireRoute,
+        WireTrigger, WireView, get_selected_nodes, get_selected_wire, get_snarl_anatomy,
+        set_selected_wire,
     },
 };
 
@@ -63,6 +64,9 @@ struct Viewer {
 
     /// Where along every wire a disc is placed, as shares of its length.
     beads: Vec<f32>,
+
+    /// A wire painted in a layer of its own choosing, and that layer.
+    layered: Option<(WirePins, WireLayer)>,
     wire_menu: bool,
     graph_menu: bool,
 
@@ -203,9 +207,14 @@ impl SnarlViewer<Node> for Viewer {
             default
         };
 
-        self.beads.iter().fold(paint, |paint, &share| {
+        let paint = self.beads.iter().fold(paint, |paint, &share| {
             paint.with_bead(share, BEAD_RADIUS, BEAD)
-        })
+        });
+
+        match self.layered {
+            Some((pins, layer)) if wire.pins == Some(pins) => paint.with_layer(layer),
+            _ => paint,
+        }
     }
 
     fn wire_action(&mut self, action: &WireAction, _ui: &mut Ui, snarl: &mut Snarl<Node>) {
@@ -800,6 +809,89 @@ fn beads_ride_on_the_path_a_wire_is_painted_and_picked_along() {
                 "custom route {custom_route}, scale {scale}"
             );
         }
+    }
+}
+
+#[test]
+fn one_wire_can_be_painted_above_the_nodes_while_the_rest_stay_behind() {
+    for (style_layer, own_layer) in [
+        (WireLayer::BehindNodes, WireLayer::AboveNodes),
+        (WireLayer::AboveNodes, WireLayer::BehindNodes),
+    ] {
+        // Two wires from the left node to the right one, both passing the node in between.
+        let mut snarl = Snarl::new();
+        let left = snarl.insert_node(pos2(0.0, 0.0), Node::plain("left", 0, 2));
+        let between = snarl.insert_node(pos2(190.0, 0.0), Node::plain("between", 2, 0));
+        let right = snarl.insert_node(pos2(420.0, 0.0), Node::plain("right", 2, 0));
+
+        let plain = WirePins::new(out_pin(left, 0), in_pin(right, 0));
+        let layered = WirePins::new(out_pin(left, 1), in_pin(right, 1));
+        snarl.connect(plain.out_pin, plain.in_pin);
+        snarl.connect(layered.out_pin, layered.in_pin);
+
+        let mut world = World::new(
+            snarl,
+            Viewer {
+                layered: Some((layered, own_layer)),
+                ..Viewer::default()
+            },
+        );
+        world.style.wire_layer = Some(style_layer);
+
+        let spot = empty_spot(&world.outer());
+        world.move_to(spot);
+        let output = world.settle();
+        let anatomy = world.outer();
+        let to_screen = anatomy.transform.to_global;
+        let shapes = painted(&output);
+
+        let frame = anatomy.node(between).unwrap().screen_rect;
+        let node = shapes
+            .iter()
+            .position(|shape| {
+                matches!(shape, Shape::Rect(rect)
+                if rect.rect.min.distance(frame.min) < 0.5 && rect.rect.max.distance(frame.max) < 0.5)
+            })
+            .expect("the frame of the node in between was painted");
+
+        let order = |pins: WirePins| {
+            let wire = anatomy.wire(pins).expect("the wire was measured");
+            let on_screen = wire.geometry.transformed(to_screen);
+            assert!(
+                on_screen
+                    .points()
+                    .iter()
+                    .any(|&point| frame.shrink(2.0).contains(point)),
+                "the wire passes the node in between"
+            );
+            first_painted_along(&shapes, on_screen.points()).expect("the wire was painted")
+        };
+
+        let (behind, above) = match own_layer {
+            WireLayer::AboveNodes => (plain, layered),
+            WireLayer::BehindNodes => (layered, plain),
+        };
+        assert!(order(behind) < node, "style {style_layer:?}");
+        assert!(order(above) > node, "style {style_layer:?}");
+        assert_eq!(
+            anatomy.wire(layered).unwrap().paint.layer(),
+            Some(own_layer)
+        );
+        assert_eq!(anatomy.wire(plain).unwrap().paint.layer(), None);
+
+        // Painting a wire above a node does not take the pointer from that node.
+        let over_node = anatomy
+            .wire(above)
+            .unwrap()
+            .geometry
+            .transformed(to_screen)
+            .points()
+            .iter()
+            .copied()
+            .find(|&point| frame.shrink(2.0).contains(point))
+            .unwrap();
+        world.move_to(over_node);
+        assert_eq!(world.outer().hovered_wire().map(|wire| wire.pins), None);
     }
 }
 

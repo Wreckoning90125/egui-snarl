@@ -1241,10 +1241,9 @@ where
     let wire_width = style.get_wire_width(ui.style());
     let wire_layer = style.get_wire_layer();
 
-    let wire_shape_idx = match wire_layer {
-        WireLayer::BehindNodes => Some(ui.painter().add(Shape::Noop)),
-        WireLayer::AboveNodes => None,
-    };
+    // Wires are routed after the nodes are laid out. Those painted behind the nodes go into
+    // this slot, which comes before every node in paint order.
+    let wires_behind_idx = ui.painter().add(Shape::Noop);
 
     let mut input_info = HashMap::new();
     let mut output_info = HashMap::new();
@@ -1583,10 +1582,14 @@ where
         ui.ctx().request_repaint();
     }
 
-    let mut wire_shapes = Vec::new();
+    let mut wires_behind = Vec::new();
+    let mut wires_above = Vec::new();
     for wire in &laid_wires {
-        wire.paint
-            .paint(&wire.geometry, ui.clip_rect(), &mut wire_shapes);
+        let shapes = match wire.paint.layer().unwrap_or(wire_layer) {
+            WireLayer::BehindNodes => &mut wires_behind,
+            WireLayer::AboveNodes => &mut wires_above,
+        };
+        wire.paint.paint(&wire.geometry, ui.clip_rect(), shapes);
     }
 
     // Widgets riding on the middle of wires.
@@ -1615,7 +1618,8 @@ where
                 let covers_pin =
                     widget_rect.intersects(from_r.rect) || widget_rect.intersects(to_r.rect);
 
-                let behind_node = wire_layer == WireLayer::BehindNodes
+                let behind_node = wire.paint.layer().unwrap_or(wire_layer)
+                    == WireLayer::BehindNodes
                     && measured_nodes
                         .iter()
                         .any(|node| node.final_rect.intersects(widget_rect));
@@ -1914,16 +1918,16 @@ where
             snarl,
         );
 
-        paint.paint(&geometry, ui.clip_rect(), &mut wire_shapes);
+        let shapes = match paint.layer().unwrap_or(wire_layer) {
+            WireLayer::BehindNodes => &mut wires_behind,
+            WireLayer::AboveNodes => &mut wires_above,
+        };
+        paint.paint(&geometry, ui.clip_rect(), shapes);
     }
 
-    match wire_shape_idx {
-        None => {
-            ui.painter().add(Shape::Vec(wire_shapes));
-        }
-        Some(idx) => {
-            ui.painter().set(idx, Shape::Vec(wire_shapes));
-        }
+    ui.painter().set(wires_behind_idx, Shape::Vec(wires_behind));
+    if !wires_above.is_empty() {
+        ui.painter().add(Shape::Vec(wires_above));
     }
 
     ui.advance_cursor_after_rect(Rect::from_min_size(snarl_resp.rect.min, Vec2::ZERO));

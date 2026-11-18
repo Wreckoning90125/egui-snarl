@@ -849,6 +849,7 @@ pub struct WirePaint {
     strokes: SmallVec<[Stroke; 4]>,
     beads: SmallVec<[WireBead; 4]>,
     hit_width: f32,
+    layer: Option<WireLayer>,
 }
 
 impl WirePaint {
@@ -860,6 +861,7 @@ impl WirePaint {
             strokes: smallvec::smallvec![stroke],
             beads: SmallVec::new(),
             hit_width: stroke.width,
+            layer: None,
         }
     }
 
@@ -873,6 +875,7 @@ impl WirePaint {
             strokes: SmallVec::new(),
             beads: SmallVec::new(),
             hit_width: 0.0,
+            layer: None,
         }
     }
 
@@ -938,6 +941,16 @@ impl WirePaint {
         self
     }
 
+    /// Paints this wire behind or above the nodes, whatever
+    /// [`SnarlStyle::wire_layer`](super::SnarlStyle::wire_layer) says for the rest.
+    ///
+    /// Only the painting moves. A node still takes the pointer where it covers the wire.
+    #[must_use]
+    pub const fn with_layer(mut self, layer: WireLayer) -> Self {
+        self.layer = Some(layer);
+        self
+    }
+
     /// Strokes painted along the wire, back to front.
     #[must_use]
     #[inline]
@@ -957,6 +970,13 @@ impl WirePaint {
     #[inline]
     pub const fn hit_width(&self) -> f32 {
         self.hit_width
+    }
+
+    /// The layer asked for with [`WirePaint::with_layer`], or `None` to follow the style.
+    #[must_use]
+    #[inline]
+    pub const fn layer(&self) -> Option<WireLayer> {
+        self.layer
     }
 
     fn widest(&self) -> f32 {
