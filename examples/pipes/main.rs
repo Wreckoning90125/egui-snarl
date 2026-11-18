@@ -76,6 +76,9 @@ struct PipesApp {
 
     /// Whether the panel with every number of the models is open.
     parameters: bool,
+
+    /// How wide each of the two views was when they were last fitted.
+    view_width: f32,
 }
 
 /// One number of a model, with the range it can be set in.
@@ -97,6 +100,7 @@ impl PipesApp {
             paused: false,
             reduced_motion: false,
             parameters: false,
+            view_width: 0.0,
         }
     }
 
@@ -184,13 +188,8 @@ impl PipesApp {
             self.viewer.reset();
             self.viewer.fit();
         }
-        if ui
-            .toggle_value(&mut self.parameters, "Parameters")
-            .on_hover_text("Every number the models and the look use")
-            .changed()
-        {
-            self.viewer.fit();
-        }
+        ui.toggle_value(&mut self.parameters, "Parameters")
+            .on_hover_text("Every number the models and the look use");
     }
 
     fn parameters(&mut self, ui: &mut Ui) {
@@ -527,7 +526,7 @@ impl App for PipesApp {
         if self.parameters {
             egui::Panel::right("parameters")
                 .resizable(false)
-                .default_size(300.0)
+                .exact_size(300.0)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| self.parameters(ui));
                 });
@@ -538,10 +537,15 @@ impl App for PipesApp {
             ui.horizontal_wrapped(|ui| ui.label(status));
         });
 
+        // The two views share what is left evenly, and are fitted again when that changes.
         let half = 0.5 * ui.available_width();
+        if (half - self.view_width).abs() > 0.5 {
+            self.view_width = half;
+            self.viewer.fit();
+        }
         egui::Panel::left("compare")
-            .resizable(true)
-            .default_size(half)
+            .resizable(false)
+            .exact_size(half)
             .show(ui, |ui| {
                 let caption = match self.compare_with {
                     Look::Beads => "A  Beads travelling along a line",
