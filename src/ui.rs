@@ -1077,7 +1077,14 @@ where
 {
     #![allow(clippy::too_many_lines)]
 
-    let (global_pointer, modifiers) = ui.ctx().input(|i| (i.pointer.latest_pos(), i.modifiers));
+    // A finger lifted from a touch screen leaves no pointer behind, but where it was lifted is
+    // still known in the pass that reports the tap or the end of the drag.
+    let (global_pointer, modifiers) = ui.ctx().input(|i| {
+        (
+            i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()),
+            i.modifiers,
+        )
+    });
 
     let bg_frame = style.get_bg_frame(ui.style());
 
@@ -1329,7 +1336,7 @@ where
         snarl_state.select_wire(None);
     }
 
-    // A click or touch on the canvas is still a candidate for a wire after the pointer is gone.
+    // A tap on the canvas is still a candidate for a wire in the pass the finger is lifted.
     let canvas_clicked = snarl_resp
         .flags
         .intersects(Flags::CLICKED | Flags::LONG_TOUCHED);

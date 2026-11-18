@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use egui::{
     Color32, Context, Event, FullOutput, Id, Key, Modifiers, PointerButton, Pos2, RawInput, Rect,
-    Shape, Ui, Vec2, emath::TSTransform, pos2, vec2,
+    Shape, TouchDeviceId, TouchId, TouchPhase, Ui, Vec2, emath::TSTransform, pos2, vec2,
 };
 use egui_snarl::{
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
@@ -364,6 +364,60 @@ impl World {
     fn zoom_at(&mut self, pos: Pos2, factor: f32) {
         self.move_to(pos);
         let _ = self.frame(vec![Event::Zoom(factor)]);
+        let _ = self.frame(Vec::new());
+    }
+
+    /// One finger going down, moving or lifting, with the pointer events a windowing
+    /// backend sends alongside it.
+    fn touch(&mut self, phase: TouchPhase, pos: Pos2) {
+        let mut events = vec![Event::Touch {
+            device_id: TouchDeviceId(0),
+            id: TouchId(0),
+            phase,
+            pos,
+            force: None,
+        }];
+
+        match phase {
+            TouchPhase::Start => {
+                events.push(Event::PointerMoved(pos));
+                events.push(Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            TouchPhase::Move => events.push(Event::PointerMoved(pos)),
+            TouchPhase::End | TouchPhase::Cancel => {
+                events.push(Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                });
+                events.push(Event::PointerGone);
+            }
+        }
+
+        let _ = self.frame(events);
+    }
+
+    /// Puts a finger down on `pos` and lifts it again at once.
+    fn tap(&mut self, pos: Pos2) {
+        self.touch(TouchPhase::Start, pos);
+        let _ = self.frame(Vec::new());
+        self.touch(TouchPhase::End, pos);
+        let _ = self.frame(Vec::new());
+    }
+
+    /// Holds a finger still on `pos` for longer than a tap may last, then lifts it.
+    fn long_press(&mut self, pos: Pos2) {
+        self.touch(TouchPhase::Start, pos);
+        for _ in 0..60 {
+            let _ = self.frame(Vec::new());
+        }
+        self.touch(TouchPhase::End, pos);
         let _ = self.frame(Vec::new());
     }
 
@@ -1042,6 +1096,116 @@ fn reconnect_select_move_and_zoom_keep_working_beside_wire_actions() {
         );
     }
     assert_eq!(world.wires(), vec![wire]);
+}
+
+#[test]
+fn a_finger_held_on_a_wire_acts_on_it_and_a_finger_dragged_still_pans() {
+    let (snarl, wire) = pair(true);
+    let mut world = World::new(snarl, Viewer::default());
+    let _ = world.settle();
+
+    let on_wire = |world: &World| {
+        let anatomy = world.outer();
+        anatomy
+            .wire(wire)
+            .unwrap()
+            .geometry
+            .transformed(anatomy.transform.to_global)
+            .midpoint()
+            .pos
+    };
+
+    // A tap selects the wire, although no pointer is left once the finger is lifted.
+    let tapped = on_wire(&world);
+    world.tap(tapped);
+
+    let triggers: Vec<WireTrigger> = world.viewer.actions.iter().map(|a| a.trigger).collect();
+    assert_eq!(triggers, vec![WireTrigger::Click]);
+    assert_eq!(get_selected_wire(view(OUTER), &world.ctx), Some(wire));
+    assert_close(
+        world.viewer.actions[0].insertion.screen_pos,
+        tapped,
+        1.0,
+        "where the finger tapped",
+    );
+    world.viewer.actions.clear();
+
+    // Without a wire menu a hold is reported as its own trigger, once, and the wire stays.
+    let held = on_wire(&world);
+    world.long_press(held);
+
+    let triggers: Vec<WireTrigger> = world.viewer.actions.iter().map(|a| a.trigger).collect();
+    assert_eq!(triggers, vec![WireTrigger::LongTouch]);
+    assert_eq!(world.viewer.actions[0].wire, wire);
+    assert_close(
+        world.viewer.actions[0].insertion.screen_pos,
+        held,
+        1.0,
+        "where the finger was held",
+    );
+    assert_eq!(world.wires(), vec![wire]);
+    assert_eq!(world.viewer.disconnects, 0);
+    assert!(world.viewer.moved.is_empty());
+
+    // With a wire menu the hold opens the menu on the wire instead.
+    world.viewer.wire_menu = true;
+    let held = on_wire(&world);
+    world.long_press(held);
+
+    assert_eq!(world.viewer.actions.len(), 1, "the menu took the hold");
+    let (menu_wire, anchor) = *world.viewer.wire_menu_anchors.first().expect("the menu opened");
+    assert_eq!(menu_wire, wire);
+    assert_close(anchor.screen_pos, held, 1.0, "wire menu anchor");
+    assert_eq!(world.wires(), vec![wire]);
+
+    // A finger dragged across the canvas, starting on the wire, still pans the view.
+    world.key(Key::Escape);
+    let _ = world.settle();
+    let before = world.outer().transform.to_global;
+    let from = on_wire(&world);
+    let by = vec2(60.0, 35.0);
+
+    world.touch(TouchPhase::Start, from);
+    for step in 1..=6 {
+        #[allow(clippy::cast_precision_loss)]
+        world.touch(TouchPhase::Move, from + by * (step as f32 / 6.0));
+    }
+    world.touch(TouchPhase::End, from + by);
+    let _ = world.settle();
+
+    let after = world.outer().transform.to_global;
+    assert_close(
+        after.translation.to_pos2(),
+        (before.translation + by).to_pos2(),
+        1.0,
+        "the view followed the finger",
+    );
+    assert!((after.scaling - before.scaling).abs() < 1e-4);
+    assert_eq!(world.wires(), vec![wire]);
+    assert_eq!(world.viewer.actions.len(), 1, "a drag is not a wire action");
+}
+
+#[test]
+fn a_finger_dragged_from_pin_to_pin_connects_them() {
+    let (snarl, wire) = pair(false);
+    let mut world = World::new(snarl, Viewer::default());
+    let _ = world.settle();
+
+    let anatomy = world.outer();
+    let from = anatomy.out_pin(wire.out_pin).unwrap().screen_center;
+    let to = anatomy.in_pin(wire.in_pin).unwrap().screen_center;
+
+    world.touch(TouchPhase::Start, from);
+    for step in 1..=6 {
+        #[allow(clippy::cast_precision_loss)]
+        world.touch(TouchPhase::Move, from.lerp(to, step as f32 / 6.0));
+    }
+    world.touch(TouchPhase::End, to);
+    let _ = world.settle();
+
+    assert_eq!(world.wires(), vec![wire]);
+    assert_eq!(world.viewer.connects, 1);
+    assert!(world.viewer.actions.is_empty());
 }
 
 #[test]
