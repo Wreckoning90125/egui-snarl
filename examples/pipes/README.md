@@ -37,7 +37,7 @@ The nodes are laid out the way the consuming application lays its own out: pins 
 edge of the node, the title on the left of the header, rows of equal height, no collapse
 button. That is layout only. The greys are egui's and the colours of the pipes are
 stand-ins that tell five pipes apart. This is not the Renderlab pipe look and does not
-claim to be: that is a separate piece of work, waiting on its source.
+claim to be: that is a separate example, [`examples/conduits`](../conduits/README.md).
 
 ## The five mechanisms
 
@@ -250,7 +250,7 @@ makes it move. Other names for the same thing are in the second column.
 | **Contents move, wall still** | | |
 | Carried contents | advection, convection, plug flow, transport along arc length | Implemented: Carried contents |
 | Separate carriers | beads, pulses, packets, particles, dashes, marching ants | Implemented earlier in `examples/interaction`; shown on the left |
-| Slugs and fill fronts | slug flow, two-phase flow, Taylor bubbles, meniscus, partial fill | Deferred. Belongs with the Renderlab port, which describes signal-dependent fill and slug speed |
+| Slugs and fill fronts | slug flow, two-phase flow, Taylor bubbles, meniscus, partial fill | Not one of these five. The Renderlab recipe in `examples/conduits` fills its bore and runs its slugs by the signal, as a look with no model behind it |
 | Faster in the middle | Poiseuille profile, shear, Taylor dispersion | Deferred. Needs contents that vary across the pipe as well as along it |
 | Mixing | diffusion, blending of pigments | Deferred. Colours are deliberately carried unmixed |
 | Back and forth | oscillatory flow, sloshing, Womersley flow | Partly: a negative command reverses every pipe. No model of its own |
