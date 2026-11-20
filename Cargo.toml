@@ -61,3 +61,16 @@ wasm-bindgen-futures.workspace = true
 [[example]]
 name = "demo"
 required-features = ["serde", "egui-probe"]
+
+[[example]]
+name = "interaction"
+path = "examples/interaction/main.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "pipes"
+path = "examples/pipes/main.rs"
+
+[[example]]
+name = "conduits"
+path = "examples/conduits/main.rs"

@@ -1,0 +1,283 @@
+{
+  "graph": {
+    "nodes": {
+      "0": {
+        "open": true,
+        "pos": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "value": {
+          "Source": {
+            "level": 0.75,
+            "name": "Tone"
+          }
+        }
+      },
+      "1": {
+        "open": true,
+        "pos": {
+          "x": 0.0,
+          "y": 150.0
+        },
+        "value": {
+          "Source": {
+            "level": 0.25,
+            "name": "Noise"
+          }
+        }
+      },
+      "2": {
+        "open": true,
+        "pos": {
+          "x": 0.0,
+          "y": 300.0
+        },
+        "value": {
+          "Control": {
+            "name": "Sweep",
+            "rate": 0.125
+          }
+        }
+      },
+      "3": {
+        "open": true,
+        "pos": {
+          "x": 230.0,
+          "y": -50.0
+        },
+        "value": {
+          "Group": {
+            "graph": {
+              "nodes": {
+                "0": {
+                  "open": true,
+                  "pos": {
+                    "x": 0.0,
+                    "y": 0.0
+                  },
+                  "value": {
+                    "Note": {
+                      "text": "port: in"
+                    }
+                  }
+                },
+                "1": {
+                  "open": true,
+                  "pos": {
+                    "x": 0.0,
+                    "y": 90.0
+                  },
+                  "value": {
+                    "Control": {
+                      "name": "Wobble",
+                      "rate": 0.25
+                    }
+                  }
+                },
+                "2": {
+                  "open": true,
+                  "pos": {
+                    "x": 260.0,
+                    "y": 20.0
+                  },
+                  "value": {
+                    "Shaper": {
+                      "amount": 0.5,
+                      "name": "Fold"
+                    }
+                  }
+                },
+                "3": {
+                  "open": true,
+                  "pos": {
+                    "x": 450.0,
+                    "y": 30.0
+                  },
+                  "value": {
+                    "Sink": {
+                      "name": "port: out"
+                    }
+                  }
+                }
+              },
+              "wires": [
+                {
+                  "in_pin": {
+                    "input": 0,
+                    "node": 2
+                  },
+                  "out_pin": {
+                    "node": 0,
+                    "output": 0
+                  }
+                },
+                {
+                  "in_pin": {
+                    "input": 0,
+                    "node": 3
+                  },
+                  "out_pin": {
+                    "node": 2,
+                    "output": 0
+                  }
+                },
+                {
+                  "in_pin": {
+                    "input": 1,
+                    "node": 2
+                  },
+                  "out_pin": {
+                    "node": 1,
+                    "output": 0
+                  }
+                }
+              ]
+            },
+            "inputs": [
+              "in"
+            ],
+            "name": "Voice",
+            "outputs": [
+              "out"
+            ]
+          }
+        }
+      },
+      "4": {
+        "open": true,
+        "pos": {
+          "x": 250.0,
+          "y": 290.0
+        },
+        "value": {
+          "Shaper": {
+            "amount": 0.625,
+            "name": "Filter"
+          }
+        }
+      },
+      "5": {
+        "open": true,
+        "pos": {
+          "x": 520.0,
+          "y": 290.0
+        },
+        "value": {
+          "Note": {
+            "text": "Edit this text. The row grows as it wraps and the pins stay on it."
+          }
+        }
+      },
+      "6": {
+        "open": true,
+        "pos": {
+          "x": 680.0,
+          "y": 40.0
+        },
+        "value": {
+          "Mix": {
+            "gains": [
+              1.0,
+              0.75
+            ]
+          }
+        }
+      },
+      "7": {
+        "open": true,
+        "pos": {
+          "x": 880.0,
+          "y": 60.0
+        },
+        "value": {
+          "Sink": {
+            "name": "Output"
+          }
+        }
+      }
+    },
+    "wires": [
+      {
+        "in_pin": {
+          "input": 0,
+          "node": 3
+        },
+        "out_pin": {
+          "node": 0,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 0,
+          "node": 4
+        },
+        "out_pin": {
+          "node": 1,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 0,
+          "node": 5
+        },
+        "out_pin": {
+          "node": 4,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 0,
+          "node": 6
+        },
+        "out_pin": {
+          "node": 3,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 0,
+          "node": 7
+        },
+        "out_pin": {
+          "node": 6,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 1,
+          "node": 4
+        },
+        "out_pin": {
+          "node": 2,
+          "output": 0
+        }
+      },
+      {
+        "in_pin": {
+          "input": 1,
+          "node": 6
+        },
+        "out_pin": {
+          "node": 5,
+          "output": 0
+        }
+      }
+    ]
+  },
+  "settings": {
+    "glow": true,
+    "hit_tolerance": 9.0,
+    "midpoint_handles": false,
+    "pulses": false,
+    "reduced_motion": false,
+    "routing": "Default",
+    "slack": 0.0625,
+    "sway": 0.5
+  }
+}

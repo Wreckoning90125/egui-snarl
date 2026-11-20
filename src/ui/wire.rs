@@ -1,7 +1,12 @@
+use std::{collections::hash_map::Entry, sync::Arc};
+
 use ahash::HashMap;
-use egui::{Context, Id, Pos2, Rect, Shape, Stroke, Ui, cache::CacheTrait, pos2};
+use egui::{Color32, Context, Id, Pos2, Rect, Shape, Stroke, Vec2, cache::CacheTrait, pos2};
+use smallvec::SmallVec;
 
 use crate::{InPinId, OutPinId};
+
+use super::cable::CableGeometry;
 
 const MAX_CURVE_SAMPLES: usize = 100;
 
@@ -79,7 +84,7 @@ pub const fn pick_wire_style(left: WireStyle, right: WireStyle) -> WireStyle {
     }
 }
 
-fn adjust_frame_size(
+pub fn adjust_frame_size(
     mut frame_size: f32,
     upscale: bool,
     downscale: bool,
@@ -227,130 +232,6 @@ fn wire_bezier_3(frame_size: f32, from: Pos2, to: Pos2) -> [Pos2; 4] {
     [a, b, c, d]
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn draw_wire(
-    ui: &Ui,
-    wire: WireId,
-    shapes: &mut Vec<Shape>,
-    frame_size: f32,
-    upscale: bool,
-    downscale: bool,
-    from: Pos2,
-    to: Pos2,
-    mut stroke: Stroke,
-    threshold: f32,
-    style: WireStyle,
-) {
-    if !ui.is_visible() {
-        return;
-    }
-
-    if stroke.width < 1.0 {
-        stroke.color = stroke.color.gamma_multiply(stroke.width);
-        stroke.width = 1.0;
-    }
-
-    let frame_size = adjust_frame_size(frame_size, upscale, downscale, from, to);
-
-    let args = WireArgs {
-        frame_size,
-        from,
-        to,
-        radius: 0.0,
-    };
-
-    match style {
-        WireStyle::Line => {
-            let bb = Rect::from_two_pos(from, to);
-            if ui.is_rect_visible(bb) {
-                shapes.push(Shape::line_segment([from, to], stroke));
-            }
-        }
-        WireStyle::Bezier3 => {
-            draw_bezier_3(ui, wire, args, stroke, threshold, shapes);
-        }
-
-        WireStyle::Bezier5 => {
-            draw_bezier_5(ui, wire, args, stroke, threshold, shapes);
-        }
-
-        WireStyle::AxisAligned { corner_radius } => {
-            let args = WireArgs {
-                radius: corner_radius,
-                ..args
-            };
-            draw_axis_aligned(ui, wire, args, stroke, threshold, shapes);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn hit_wire(
-    ctx: &Context,
-    wire: WireId,
-    frame_size: f32,
-    upscale: bool,
-    downscale: bool,
-    from: Pos2,
-    to: Pos2,
-    pos: Pos2,
-    hit_threshold: f32,
-    style: WireStyle,
-) -> bool {
-    let frame_size = adjust_frame_size(frame_size, upscale, downscale, from, to);
-
-    let args = WireArgs {
-        frame_size,
-        from,
-        to,
-        radius: 0.0,
-    };
-
-    match style {
-        WireStyle::Line => {
-            let aabb = Rect::from_two_pos(from, to);
-            let aabb_e = aabb.expand(hit_threshold);
-            if !aabb_e.contains(pos) {
-                return false;
-            }
-
-            let a = to - from;
-            let b = pos - from;
-
-            let dot = b.dot(a);
-            let dist2 = b.length_sq() - dot * dot / a.length_sq();
-
-            dist2 < hit_threshold * hit_threshold
-        }
-        WireStyle::Bezier3 => hit_wire_bezier_3(ctx, wire, args, pos, hit_threshold),
-        WireStyle::Bezier5 => hit_wire_bezier_5(ctx, wire, args, pos, hit_threshold),
-        WireStyle::AxisAligned { corner_radius } => {
-            let args = WireArgs {
-                radius: corner_radius,
-                ..args
-            };
-            hit_wire_axis_aligned(ctx, wire, args, pos, hit_threshold)
-        }
-    }
-}
-
-#[inline]
-fn bezier_arc_length_upper_bound(points: &[Pos2]) -> f32 {
-    let mut size = 0.0;
-    for i in 1..points.len() {
-        size += (points[i] - points[i - 1]).length();
-    }
-    size
-}
-
-fn bezier_hit_samples_number(points: &[Pos2], threshold: f32) -> usize {
-    let arc_length = bezier_arc_length_upper_bound(points);
-
-    #[allow(clippy::cast_sign_loss)]
-    #[allow(clippy::cast_possible_truncation)]
-    ((arc_length / threshold).ceil().max(0.0) as usize)
-}
-
 fn bezier_derivative_3(points: &[Pos2; 4]) -> [Pos2; 3] {
     let [p0, p1, p2, p3] = *points;
 
@@ -477,352 +358,6 @@ fn bezier_draw_samples_number_5(points: &[Pos2; 6], threshold: f32) -> usize {
     })
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct WireArgs {
-    frame_size: f32,
-    from: Pos2,
-    to: Pos2,
-    radius: f32,
-}
-
-impl Default for WireArgs {
-    fn default() -> Self {
-        WireArgs {
-            frame_size: 0.0,
-            from: Pos2::ZERO,
-            to: Pos2::ZERO,
-            radius: 0.0,
-        }
-    }
-}
-
-struct WireCache3 {
-    generation: u32,
-    args: WireArgs,
-    aabb: Rect,
-    points: [Pos2; 4],
-    threshold: f32,
-    line: Vec<Pos2>,
-}
-
-impl Default for WireCache3 {
-    fn default() -> Self {
-        WireCache3 {
-            generation: 0,
-            args: WireArgs::default(),
-            aabb: Rect::NOTHING,
-            points: [Pos2::ZERO; 4],
-            threshold: 0.0,
-            line: Vec::new(),
-        }
-    }
-}
-
-impl WireCache3 {
-    fn line(&mut self, threshold: f32) -> Vec<Pos2> {
-        #[allow(clippy::float_cmp)]
-        if !self.line.is_empty() && self.threshold == threshold {
-            return self.line.clone();
-        }
-
-        let samples = bezier_draw_samples_number_3(&self.points, threshold);
-
-        let line = (0..samples)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / (samples - 1) as f32;
-                sample_bezier(&self.points, t)
-            })
-            .collect::<Vec<Pos2>>();
-
-        self.threshold = threshold;
-        self.line.clone_from(&line);
-
-        line
-    }
-}
-
-struct WireCache5 {
-    generation: u32,
-    args: WireArgs,
-    aabb: Rect,
-    points: [Pos2; 6],
-    threshold: f32,
-    line: Vec<Pos2>,
-}
-
-impl Default for WireCache5 {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            args: WireArgs::default(),
-            aabb: Rect::NOTHING,
-            points: [Pos2::ZERO; 6],
-            threshold: 0.0,
-            line: Vec::new(),
-        }
-    }
-}
-
-impl WireCache5 {
-    fn line(&mut self, threshold: f32) -> Vec<Pos2> {
-        #[allow(clippy::float_cmp)]
-        if !self.line.is_empty() && self.threshold == threshold {
-            return self.line.clone();
-        }
-
-        let samples = bezier_draw_samples_number_5(&self.points, threshold);
-
-        let line = (0..samples)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / (samples - 1) as f32;
-                sample_bezier(&self.points, t)
-            })
-            .collect::<Vec<Pos2>>();
-
-        self.threshold = threshold;
-        self.line.clone_from(&line);
-
-        line
-    }
-}
-
-#[derive(Default)]
-struct WireCacheAA {
-    generation: u32,
-    args: WireArgs,
-    aawire: AxisAlignedWire,
-    threshold: f32,
-    line: Vec<Pos2>,
-}
-
-impl WireCacheAA {
-    fn line(&mut self, threshold: f32) -> Vec<Pos2> {
-        #[allow(clippy::float_cmp)]
-        if !self.line.is_empty() && self.threshold == threshold {
-            return self.line.clone();
-        }
-
-        let mut line = Vec::new();
-
-        for i in 0..self.aawire.turns {
-            // shapes.push(Shape::line_segment(
-            //     [wire.segments[i].0, wire.segments[i].1],
-            //     stroke,
-            // ));
-
-            // Draw segment first
-            line.push(self.aawire.segments[i].0);
-            line.push(self.aawire.segments[i].1);
-
-            if self.aawire.turn_radii[i] > 0.0 {
-                let turn = self.aawire.turn_centers[i];
-                let samples = turn_samples_number(self.aawire.turn_radii[i], self.threshold);
-
-                let start = self.aawire.segments[i].1;
-                let end = self.aawire.segments[i + 1].0;
-
-                let sin_x = end.x - turn.x;
-                let cos_x = start.x - turn.x;
-
-                let sin_y = end.y - turn.y;
-                let cos_y = start.y - turn.y;
-
-                for j in 1..samples {
-                    #[allow(clippy::cast_precision_loss)]
-                    let a = std::f32::consts::FRAC_PI_2 * (j as f32 / samples as f32);
-
-                    let (sin_a, cos_a) = a.sin_cos();
-
-                    let point: Pos2 = pos2(
-                        cos_x.mul_add(cos_a, sin_x.mul_add(sin_a, turn.x)),
-                        cos_y.mul_add(cos_a, sin_y.mul_add(sin_a, turn.y)),
-                    );
-                    line.push(point);
-                }
-            }
-        }
-
-        line.push(self.aawire.segments[self.aawire.turns].0);
-        line.push(self.aawire.segments[self.aawire.turns].1);
-
-        self.threshold = threshold;
-        self.line.clone_from(&line);
-
-        line
-    }
-}
-
-#[derive(Default)]
-struct WiresCache {
-    generation: u32,
-    bezier_3: HashMap<WireId, WireCache3>,
-    bezier_5: HashMap<WireId, WireCache5>,
-    axis_aligned: HashMap<WireId, WireCacheAA>,
-}
-
-impl CacheTrait for WiresCache {
-    fn update(&mut self) {
-        self.bezier_3
-            .retain(|_, cache| cache.generation == self.generation);
-        self.bezier_5
-            .retain(|_, cache| cache.generation == self.generation);
-        self.axis_aligned
-            .retain(|_, cache| cache.generation == self.generation);
-
-        self.generation = self.generation.wrapping_add(1);
-    }
-
-    fn len(&self) -> usize {
-        self.bezier_3.len() + self.bezier_5.len() + self.axis_aligned.len()
-    }
-}
-
-impl WiresCache {
-    pub fn get_3(&mut self, wire: WireId, args: WireArgs) -> &mut WireCache3 {
-        let cached = self.bezier_3.entry(wire).or_default();
-
-        cached.generation = self.generation;
-
-        if cached.args == args {
-            return cached;
-        }
-
-        let points = wire_bezier_3(args.frame_size, args.from, args.to);
-        let aabb = Rect::from_points(&points);
-
-        cached.args = args;
-        cached.points = points;
-        cached.aabb = aabb;
-        cached.line.clear();
-
-        cached
-    }
-
-    pub fn get_5(&mut self, wire: WireId, args: WireArgs) -> &mut WireCache5 {
-        let cached = self.bezier_5.entry(wire).or_default();
-
-        cached.generation = self.generation;
-
-        if cached.args == args {
-            return cached;
-        }
-
-        let points = wire_bezier_5(args.frame_size, args.from, args.to);
-        let aabb = Rect::from_points(&points);
-
-        cached.args = args;
-        cached.points = points;
-        cached.aabb = aabb;
-        cached.line.clear();
-
-        cached
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn get_aa(&mut self, wire: WireId, args: WireArgs) -> &mut WireCacheAA {
-        let cached = self.axis_aligned.entry(wire).or_default();
-
-        cached.generation = self.generation;
-
-        if cached.args == args {
-            return cached;
-        }
-
-        let aawire = wire_axis_aligned(args.radius, args.frame_size, args.from, args.to);
-
-        cached.args = args;
-        cached.aawire = aawire;
-        cached.line.clear();
-
-        cached
-    }
-}
-
-#[inline(never)]
-fn draw_bezier_3(
-    ui: &Ui,
-    wire: WireId,
-    args: WireArgs,
-    stroke: Stroke,
-    threshold: f32,
-    shapes: &mut Vec<Shape>,
-) {
-    debug_assert!(ui.is_visible(), "Must be checked earlier");
-
-    let clip_rect = ui.clip_rect();
-
-    ui.memory_mut(|m| {
-        let cached = m.caches.cache::<WiresCache>().get_3(wire, args);
-
-        if cached.aabb.intersects(clip_rect) {
-            shapes.push(Shape::line(cached.line(threshold), stroke));
-        }
-    });
-
-    // {
-    //     let samples = bezier_draw_samples_number_3(points, threshold);
-    //     shapes.push(Shape::line(
-    //         points.to_vec(),
-    //         Stroke::new(1.0, Color32::PLACEHOLDER),
-    //     ));
-
-    //     let samples = 100;
-    //     shapes.push(Shape::line(
-    //         (0..samples)
-    //             .map(|i| {
-    //                 #[allow(clippy::cast_precision_loss)]
-    //                 let t = i as f32 / (samples - 1) as f32;
-    //                 sample_bezier(points, t)
-    //             })
-    //             .collect(),
-    //         Stroke::new(1.0, Color32::PLACEHOLDER),
-    //     ));
-    // }
-}
-
-fn draw_bezier_5(
-    ui: &Ui,
-    wire: WireId,
-    args: WireArgs,
-    stroke: Stroke,
-    threshold: f32,
-    shapes: &mut Vec<Shape>,
-) {
-    debug_assert!(ui.is_visible(), "Must be checked earlier");
-
-    let clip_rect = ui.clip_rect();
-
-    ui.memory_mut(|m| {
-        let cached = m.caches.cache::<WiresCache>().get_5(wire, args);
-
-        if cached.aabb.intersects(clip_rect) {
-            shapes.push(Shape::line(cached.line(threshold), stroke));
-        }
-    });
-
-    // {
-    //     let samples = bezier_draw_samples_number_5(points, threshold);
-    //     shapes.push(Shape::line(
-    //         points.to_vec(),
-    //         Stroke::new(1.0, Color32::PLACEHOLDER),
-    //     ));
-
-    //     let samples = 100;
-    //     shapes.push(Shape::line(
-    //         (0..samples)
-    //             .map(|i| {
-    //                 #[allow(clippy::cast_precision_loss)]
-    //                 let t = i as f32 / (samples - 1) as f32;
-    //                 sample_bezier(points, t)
-    //             })
-    //             .collect(),
-    //         Stroke::new(1.0, Color32::PLACEHOLDER),
-    //     ));
-    // }
-}
-
 // #[allow(clippy::let_and_return)]
 fn sample_bezier(points: &[Pos2], t: f32) -> Pos2 {
     match *points {
@@ -883,164 +418,6 @@ fn sample_bezier(points: &[Pos2], t: f32) -> Pos2 {
         }
         _ => unimplemented!(),
     }
-}
-
-fn split_bezier_3(points: &[Pos2; 4], t: f32) -> [[Pos2; 4]; 2] {
-    let [p0, p1, p2, p3] = *points;
-
-    let p0_0 = p0;
-    let p1_0 = p1;
-    let p2_0 = p2;
-    let p3_0 = p3;
-
-    let p0_1 = p0_0.lerp(p1_0, t);
-    let p1_1 = p1_0.lerp(p2_0, t);
-    let p2_1 = p2_0.lerp(p3_0, t);
-
-    let p0_2 = p0_1.lerp(p1_1, t);
-    let p1_2 = p1_1.lerp(p2_1, t);
-
-    let p0_3 = p0_2.lerp(p1_2, t);
-
-    [[p0_0, p0_1, p0_2, p0_3], [p0_3, p1_2, p2_1, p3_0]]
-}
-
-fn hit_wire_bezier_3(
-    ctx: &Context,
-    wire: WireId,
-    args: WireArgs,
-    pos: Pos2,
-    hit_threshold: f32,
-) -> bool {
-    let (aabb, points) = ctx.memory_mut(|m| {
-        let cache = m.caches.cache::<WiresCache>().get_3(wire, args);
-
-        (cache.aabb, cache.points)
-    });
-
-    let aabb_e = aabb.expand(hit_threshold);
-    if !aabb_e.contains(pos) {
-        return false;
-    }
-
-    hit_bezier_3(&points, pos, hit_threshold)
-}
-
-fn hit_bezier_3(points: &[Pos2; 4], pos: Pos2, hit_threshold: f32) -> bool {
-    let samples = bezier_hit_samples_number(points, hit_threshold);
-    if samples > 8 {
-        let [points1, points2] = split_bezier_3(points, 0.5);
-
-        let aabb_e = Rect::from_points(&points1).expand(hit_threshold);
-        if aabb_e.contains(pos) && hit_bezier_3(&points1, pos, hit_threshold) {
-            return true;
-        }
-        let aabb_e = Rect::from_points(&points2).expand(hit_threshold);
-        if aabb_e.contains(pos) && hit_bezier_3(&points2, pos, hit_threshold) {
-            return true;
-        }
-        return false;
-    }
-
-    let threshold_sq = hit_threshold * hit_threshold;
-
-    for i in 0..samples {
-        #[allow(clippy::cast_precision_loss)]
-        let t = i as f32 / (samples - 1) as f32;
-        let p = sample_bezier(points, t);
-        if p.distance_sq(pos) <= threshold_sq {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn split_bezier_5(points: &[Pos2; 6], t: f32) -> [[Pos2; 6]; 2] {
-    let [p0, p1, p2, p3, p4, p5] = *points;
-
-    let p0_0 = p0;
-    let p1_0 = p1;
-    let p2_0 = p2;
-    let p3_0 = p3;
-    let p4_0 = p4;
-    let p5_0 = p5;
-
-    let p0_1 = p0_0.lerp(p1_0, t);
-    let p1_1 = p1_0.lerp(p2_0, t);
-    let p2_1 = p2_0.lerp(p3_0, t);
-    let p3_1 = p3_0.lerp(p4_0, t);
-    let p4_1 = p4_0.lerp(p5_0, t);
-
-    let p0_2 = p0_1.lerp(p1_1, t);
-    let p1_2 = p1_1.lerp(p2_1, t);
-    let p2_2 = p2_1.lerp(p3_1, t);
-    let p3_2 = p3_1.lerp(p4_1, t);
-
-    let p0_3 = p0_2.lerp(p1_2, t);
-    let p1_3 = p1_2.lerp(p2_2, t);
-    let p2_3 = p2_2.lerp(p3_2, t);
-
-    let p0_4 = p0_3.lerp(p1_3, t);
-    let p1_4 = p1_3.lerp(p2_3, t);
-
-    let p0_5 = p0_4.lerp(p1_4, t);
-
-    [
-        [p0_0, p0_1, p0_2, p0_3, p0_4, p0_5],
-        [p0_5, p1_4, p2_3, p3_2, p4_1, p5_0],
-    ]
-}
-
-fn hit_wire_bezier_5(
-    ctx: &Context,
-    wire: WireId,
-    args: WireArgs,
-    pos: Pos2,
-    hit_threshold: f32,
-) -> bool {
-    let (aabb, points) = ctx.memory_mut(|m| {
-        let cache = m.caches.cache::<WiresCache>().get_5(wire, args);
-
-        (cache.aabb, cache.points)
-    });
-
-    let aabb_e = aabb.expand(hit_threshold);
-    if !aabb_e.contains(pos) {
-        return false;
-    }
-
-    hit_bezier_5(&points, pos, hit_threshold)
-}
-
-fn hit_bezier_5(points: &[Pos2; 6], pos: Pos2, hit_threshold: f32) -> bool {
-    let samples = bezier_hit_samples_number(points, hit_threshold);
-    if samples > 16 {
-        let [points1, points2] = split_bezier_5(points, 0.5);
-        let aabb_e = Rect::from_points(&points1).expand(hit_threshold);
-        if aabb_e.contains(pos) && hit_bezier_5(&points1, pos, hit_threshold) {
-            return true;
-        }
-        let aabb_e = Rect::from_points(&points2).expand(hit_threshold);
-        if aabb_e.contains(pos) && hit_bezier_5(&points2, pos, hit_threshold) {
-            return true;
-        }
-        return false;
-    }
-
-    let threshold_sq = hit_threshold * hit_threshold;
-
-    for i in 0..samples {
-        #[allow(clippy::cast_precision_loss)]
-        let t = i as f32 / (samples - 1) as f32;
-        let p = sample_bezier(points, t);
-
-        if p.distance_sq(pos) <= threshold_sq {
-            return true;
-        }
-    }
-
-    false
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1201,100 +578,6 @@ fn wire_axis_aligned(corner_radius: f32, frame_size: f32, from: Pos2, to: Pos2) 
     }
 }
 
-fn hit_wire_axis_aligned(
-    ctx: &Context,
-    wire: WireId,
-    args: WireArgs,
-    pos: Pos2,
-    hit_threshold: f32,
-) -> bool {
-    let aawire = ctx.memory_mut(|m| {
-        let cache = m.caches.cache::<WiresCache>().get_aa(wire, args);
-
-        cache.aawire
-    });
-
-    // Check AABB first
-    if !aawire.aabb.expand(hit_threshold).contains(pos) {
-        return false;
-    }
-
-    // Check all straight segments first
-    // Number of segments is number of turns + 1
-    for i in 0..aawire.turns + 1 {
-        let (start, end) = aawire.segments[i];
-
-        // Segments are always axis aligned
-        // So we can use AABB for checking
-        if Rect::from_two_pos(start, end)
-            .expand(hit_threshold)
-            .contains(pos)
-        {
-            return true;
-        }
-    }
-
-    // Check all turns
-    for i in 0..aawire.turns {
-        if aawire.turn_radii[i] > 0.0 {
-            let turn = aawire.turn_centers[i];
-            let turn_aabb = Rect::from_two_pos(aawire.segments[i].1, aawire.segments[i + 1].0);
-            if !turn_aabb.contains(pos) {
-                continue;
-            }
-
-            // Avoid sqrt
-            let dist2 = (turn - pos).length_sq();
-            let min = aawire.turn_radii[i] - hit_threshold;
-            let max = aawire.turn_radii[i] + hit_threshold;
-
-            if dist2 <= max * max && dist2 >= min * min {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn turn_samples_number(radius: f32, threshold: f32) -> usize {
-    #![allow(clippy::cast_sign_loss)]
-    #![allow(clippy::cast_possible_truncation)]
-    #![allow(clippy::cast_precision_loss)]
-
-    if threshold / radius >= 1.0 {
-        return 2;
-    }
-
-    let a: f32 = (1.0 - threshold / radius).acos();
-    let samples = (std::f32::consts::PI / (4.0 * a) + 1.0)
-        .min(MAX_CURVE_SAMPLES as f32)
-        .ceil() as usize;
-
-    samples.clamp(2, MAX_CURVE_SAMPLES)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_axis_aligned(
-    ui: &Ui,
-    wire: WireId,
-    args: WireArgs,
-    stroke: Stroke,
-    threshold: f32,
-    shapes: &mut Vec<Shape>,
-) {
-    debug_assert!(ui.is_visible(), "Must be checked earlier");
-
-    let clip_rect = ui.clip_rect();
-    ui.memory_mut(|m| {
-        let cached = m.caches.cache::<WiresCache>().get_aa(wire, args);
-
-        if cached.aawire.aabb.intersects(clip_rect) {
-            shapes.push(Shape::line(cached.line(threshold), stroke));
-        }
-    });
-}
-
 /// Very basic lower-bound algorithm
 /// Finds the smallest number in range [min, max) that satisfies the predicate
 /// If no such number exists, returns max
@@ -1325,4 +608,798 @@ fn lower_bound(min: usize, max: usize, f: impl Fn(usize) -> bool) -> usize {
     //     }
     // }
     // max
+}
+
+/// The two pins a wire joins.
+///
+/// This is the identity of a wire: it does not change while the wire is moved, restyled,
+/// rerouted, or shown in a different view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WirePins {
+    /// Output pin the wire starts at.
+    pub out_pin: OutPinId,
+
+    /// Input pin the wire ends at.
+    pub in_pin: InPinId,
+}
+
+impl WirePins {
+    /// The wire from `out_pin` to `in_pin`.
+    #[must_use]
+    #[inline]
+    pub const fn new(out_pin: OutPinId, in_pin: InPinId) -> Self {
+        Self { out_pin, in_pin }
+    }
+}
+
+/// Everything needed to lay out the path of one wire, in graph coordinates.
+///
+/// Passed to [`SnarlViewer::wire_route`](super::SnarlViewer::wire_route).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WireRoute {
+    /// Pins the wire joins, or `None` for a wire that is still being dragged.
+    pub pins: Option<WirePins>,
+
+    /// Measured centre of the output pin, or the pointer for a wire dragged from an input.
+    pub from: Pos2,
+
+    /// Measured centre of the input pin, or the pointer for a wire dragged from an output.
+    pub to: Pos2,
+
+    /// Style picked from the two pins.
+    pub style: WireStyle,
+
+    /// Length of the straight lead out of each pin, already adjusted to the distance between them.
+    pub frame_size: f32,
+
+    /// Largest distance the path may stray from the ideal curve.
+    pub tolerance: f32,
+
+    /// Screen points per graph unit.
+    ///
+    /// A route that keeps some length the same on screen at every zoom divides that length
+    /// by this.
+    pub scale: f32,
+
+    /// Displacement asked of the middle of the wire by [`SnarlStyle::wire_slack`](super::SnarlStyle::wire_slack)
+    /// and [`SnarlStyle::wire_sway`](super::SnarlStyle::wire_sway). Zero when both are off.
+    pub sag: Vec2,
+}
+
+impl WireRoute {
+    /// The path the graph view uses when the viewer supplies none.
+    #[must_use]
+    pub fn default_route(&self) -> CableGeometry {
+        let Self {
+            from,
+            to,
+            frame_size,
+            tolerance,
+            ..
+        } = *self;
+
+        let base = match self.style {
+            WireStyle::Line => CableGeometry::line(from, to),
+            WireStyle::Bezier3 => {
+                let points = wire_bezier_3(frame_size, from, to);
+                let samples = bezier_draw_samples_number_3(&points, tolerance);
+                CableGeometry::from_points(sampled_bezier(&points, samples))
+            }
+            WireStyle::Bezier5 => {
+                let points = wire_bezier_5(frame_size, from, to);
+                let samples = bezier_draw_samples_number_5(&points, tolerance);
+                CableGeometry::from_points(sampled_bezier(&points, samples))
+            }
+            WireStyle::AxisAligned { corner_radius } => {
+                let wire = wire_axis_aligned(corner_radius, frame_size, from, to);
+                CableGeometry::from_points(axis_aligned_line(&wire))
+            }
+        };
+
+        if self.sag == Vec2::ZERO {
+            base
+        } else {
+            base.sagged(self.sag, tolerance)
+        }
+    }
+}
+
+fn sampled_bezier(points: &[Pos2], samples: usize) -> impl Iterator<Item = Pos2> + '_ {
+    let samples = samples.max(2);
+    (0..samples).map(move |i| {
+        #[allow(clippy::cast_precision_loss)]
+        let t = i as f32 / (samples - 1) as f32;
+        sample_bezier(points, t)
+    })
+}
+
+fn axis_aligned_line(wire: &AxisAlignedWire) -> Vec<Pos2> {
+    let mut line = Vec::new();
+
+    for i in 0..wire.turns {
+        line.push(wire.segments[i].0);
+        line.push(wire.segments[i].1);
+
+        if wire.turn_radii[i] > 0.0 {
+            let turn = wire.turn_centers[i];
+            // Corners have always been drawn this finely, whatever smoothness was asked for.
+            let samples = MAX_CURVE_SAMPLES;
+
+            let start = wire.segments[i].1;
+            let end = wire.segments[i + 1].0;
+
+            let sin_x = end.x - turn.x;
+            let cos_x = start.x - turn.x;
+
+            let sin_y = end.y - turn.y;
+            let cos_y = start.y - turn.y;
+
+            for j in 1..samples {
+                #[allow(clippy::cast_precision_loss)]
+                let a = std::f32::consts::FRAC_PI_2 * (j as f32 / samples as f32);
+
+                let (sin_a, cos_a) = a.sin_cos();
+
+                line.push(pos2(
+                    cos_x.mul_add(cos_a, sin_x.mul_add(sin_a, turn.x)),
+                    cos_y.mul_add(cos_a, sin_y.mul_add(sin_a, turn.y)),
+                ));
+            }
+        }
+    }
+
+    line.push(wire.segments[wire.turns].0);
+    line.push(wire.segments[wire.turns].1);
+
+    line
+}
+
+struct CachedRoute {
+    generation: u32,
+    route: WireRoute,
+    geometry: Arc<CableGeometry>,
+}
+
+#[derive(Default)]
+struct RouteCache {
+    generation: u32,
+    routes: HashMap<WireId, CachedRoute>,
+}
+
+impl CacheTrait for RouteCache {
+    fn update(&mut self) {
+        self.routes
+            .retain(|_, cached| cached.generation == self.generation);
+
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.routes.len()
+    }
+}
+
+/// Returns the default path for `route`, rebuilding it only when the request changed.
+pub fn cached_default_route(ctx: &Context, wire: WireId, route: &WireRoute) -> Arc<CableGeometry> {
+    ctx.memory_mut(|memory| {
+        let cache = memory.caches.cache::<RouteCache>();
+        let generation = cache.generation;
+
+        match cache.routes.entry(wire) {
+            Entry::Occupied(mut entry) => {
+                let cached = entry.get_mut();
+                cached.generation = generation;
+                if cached.route != *route {
+                    cached.route = *route;
+                    cached.geometry = Arc::new(route.default_route());
+                }
+                Arc::clone(&cached.geometry)
+            }
+            Entry::Vacant(entry) => Arc::clone(
+                &entry
+                    .insert(CachedRoute {
+                        generation,
+                        route: *route,
+                        geometry: Arc::new(route.default_route()),
+                    })
+                    .geometry,
+            ),
+        }
+    })
+}
+
+/// A filled disc that rides on a wire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WireBead {
+    /// Fraction of the wire's arc length the disc is centred at, in `0.0..=1.0`.
+    pub share: f32,
+
+    /// Radius of the disc, in graph coordinates.
+    pub radius: f32,
+
+    /// Colour the disc is filled with.
+    pub fill: Color32,
+}
+
+/// How one wire is painted: strokes laid back to front along the wire's one path, then discs
+/// placed on it.
+///
+/// The path is the same [`CableGeometry`] the wire is hit tested with, so a wire drawn as a
+/// wide glowing tube is still picked along exactly the curve the eye sees.
+/// Colours and widths carry no meaning to the graph view; the viewer decides what they stand for.
+///
+/// A viewer that needs more than strokes and discs adds shapes of its own with
+/// [`WirePaint::under_shape`] and [`WirePaint::over_shape`]. They are painted with the wire:
+/// in its layer, inside the clip of the view, in graph coordinates, behind and in front of
+/// its strokes and discs. [`WirePaint::front_shape`] adds a shape that is painted in front of
+/// the nodes even when the wire itself runs behind them, for a fitting where a wire meets a
+/// node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WirePaint {
+    shapes_under: Vec<Shape>,
+    strokes: SmallVec<[Stroke; 4]>,
+    beads: SmallVec<[WireBead; 4]>,
+    shapes_over: Vec<Shape>,
+    shapes_in_front: Vec<Shape>,
+    hit_width: f32,
+    layer: Option<WireLayer>,
+}
+
+impl WirePaint {
+    /// A wire painted as a single stroke.
+    #[must_use]
+    pub fn solid(stroke: impl Into<Stroke>) -> Self {
+        let stroke = stroke.into();
+        Self {
+            shapes_under: Vec::new(),
+            strokes: smallvec::smallvec![stroke],
+            beads: SmallVec::new(),
+            shapes_over: Vec::new(),
+            shapes_in_front: Vec::new(),
+            hit_width: stroke.width,
+            layer: None,
+        }
+    }
+
+    /// A wire that paints nothing.
+    ///
+    /// It keeps its path, hover, selection and actions, so a viewer can draw the wire itself
+    /// from the measured [`CableGeometry`].
+    #[must_use]
+    pub fn hidden() -> Self {
+        Self {
+            shapes_under: Vec::new(),
+            strokes: SmallVec::new(),
+            beads: SmallVec::new(),
+            shapes_over: Vec::new(),
+            shapes_in_front: Vec::new(),
+            hit_width: 0.0,
+            layer: None,
+        }
+    }
+
+    /// Adds a stroke behind everything painted so far.
+    #[must_use]
+    pub fn under(mut self, stroke: impl Into<Stroke>) -> Self {
+        self.strokes.insert(0, stroke.into());
+        self
+    }
+
+    /// Adds a stroke in front of everything painted so far.
+    #[must_use]
+    pub fn over(mut self, stroke: impl Into<Stroke>) -> Self {
+        self.strokes.push(stroke.into());
+        self
+    }
+
+    /// Adds a soft halo of `color` behind the wire, reaching `spread` beyond the widest stroke
+    /// on each side.
+    #[must_use]
+    pub fn with_glow(mut self, color: Color32, spread: f32) -> Self {
+        const FALLOFF: [(f32, f32); 3] = [(1.0, 0.10), (0.6, 0.16), (0.25, 0.28)];
+
+        if !(spread > 0.0) || !spread.is_finite() {
+            return self;
+        }
+
+        let widest = self.widest();
+        let halo = FALLOFF.map(|(reach, strength)| {
+            Stroke::new(
+                (2.0 * spread).mul_add(reach, widest),
+                color.gamma_multiply(strength),
+            )
+        });
+
+        self.strokes.insert_many(0, halo);
+        self
+    }
+
+    /// Adds a filled disc of `radius` centred on the wire, `share` of the way along its length.
+    ///
+    /// Discs are painted in front of the wire's strokes, in the order they were added. The
+    /// view places each one on the path it paints and hit tests, whatever route that is, so a
+    /// viewer animates a disc by giving a different `share` on each pass.
+    #[must_use]
+    pub fn with_bead(mut self, share: f32, radius: f32, fill: Color32) -> Self {
+        self.beads.push(WireBead {
+            share,
+            radius,
+            fill,
+        });
+        self
+    }
+
+    /// Adds a shape behind the wire's strokes and discs, and behind the shapes added this
+    /// way before it.
+    ///
+    /// The shape is in graph coordinates, as the wire's path is. Build it from the path the
+    /// view hands to [`SnarlViewer::wire_paint`](super::SnarlViewer::wire_paint), for example
+    /// with [`CableGeometry::ribbon`] or [`CableGeometry::walls`], and it is painted where
+    /// the wire is picked.
+    #[must_use]
+    pub fn under_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_under.insert(0, shape.into());
+        self
+    }
+
+    /// Adds a shape in front of the wire's strokes and discs, and in front of the shapes
+    /// added this way before it. See [`WirePaint::under_shape`].
+    #[must_use]
+    pub fn over_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_over.push(shape.into());
+        self
+    }
+
+    /// Adds a shape that is painted in front of the nodes, whichever layer the wire is
+    /// painted in, and in front of the shapes added this way before it.
+    ///
+    /// It is for what sits on a node where the wire meets it: a fitting, a plug, a glow on
+    /// a socket. The rest of the wire stays in its layer. The shape is in graph coordinates
+    /// and inside the clip of the view, as the others are.
+    ///
+    /// Only painting is added. A shape over a pin does not take the pointer from the pin.
+    #[must_use]
+    pub fn front_shape(mut self, shape: impl Into<Shape>) -> Self {
+        self.shapes_in_front.push(shape.into());
+        self
+    }
+
+    /// Sets the width of the band in which the pointer counts as being on the wire.
+    ///
+    /// Defaults to the width of the stroke given to [`WirePaint::solid`]. A glow does not widen it,
+    /// and neither does a bead or a shape. A path with half widths is picked between its
+    /// walls whatever this width is.
+    /// The view never picks more narrowly than [`SnarlStyle::wire_hit_tolerance`](super::SnarlStyle::wire_hit_tolerance).
+    #[must_use]
+    pub const fn with_hit_width(mut self, width: f32) -> Self {
+        self.hit_width = width;
+        self
+    }
+
+    /// Paints this wire behind or above the nodes, whatever
+    /// [`SnarlStyle::wire_layer`](super::SnarlStyle::wire_layer) says for the rest.
+    ///
+    /// Only the painting moves. A node still takes the pointer where it covers the wire.
+    #[must_use]
+    pub const fn with_layer(mut self, layer: WireLayer) -> Self {
+        self.layer = Some(layer);
+        self
+    }
+
+    /// Strokes painted along the wire, back to front.
+    #[must_use]
+    #[inline]
+    pub fn strokes(&self) -> &[Stroke] {
+        &self.strokes
+    }
+
+    /// Discs placed on the wire, back to front.
+    #[must_use]
+    #[inline]
+    pub fn beads(&self) -> &[WireBead] {
+        &self.beads
+    }
+
+    /// Shapes painted behind the wire's strokes, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_under(&self) -> &[Shape] {
+        &self.shapes_under
+    }
+
+    /// Shapes painted in front of the wire's discs, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_over(&self) -> &[Shape] {
+        &self.shapes_over
+    }
+
+    /// Shapes painted in front of the nodes, back to front.
+    #[must_use]
+    #[inline]
+    pub fn shapes_in_front(&self) -> &[Shape] {
+        &self.shapes_in_front
+    }
+
+    /// Width of the band in which the pointer counts as being on the wire.
+    #[must_use]
+    #[inline]
+    pub const fn hit_width(&self) -> f32 {
+        self.hit_width
+    }
+
+    /// The layer asked for with [`WirePaint::with_layer`], or `None` to follow the style.
+    #[must_use]
+    #[inline]
+    pub const fn layer(&self) -> Option<WireLayer> {
+        self.layer
+    }
+
+    fn widest(&self) -> f32 {
+        self.strokes
+            .iter()
+            .map(|stroke| stroke.width)
+            .fold(0.0, f32::max)
+    }
+
+    /// Whether anything this paints for `geometry` reaches into `clip_rect`.
+    fn reaches(&self, geometry: &CableGeometry, clip_rect: Rect) -> bool {
+        let reach = self
+            .beads
+            .iter()
+            .map(|bead| bead.radius)
+            .fold(self.widest() * 0.5, f32::max);
+
+        let mut covered = geometry.bounds().expand(reach);
+        for shape in self
+            .shapes_under
+            .iter()
+            .chain(&self.shapes_over)
+            .chain(&self.shapes_in_front)
+        {
+            covered |= shape.visual_bounding_rect();
+        }
+
+        covered.intersects(clip_rect)
+    }
+
+    /// Appends the shapes that paint `geometry` this way in the layer of the wire, unless
+    /// the wire lies outside `clip_rect`.
+    ///
+    /// Shapes added with [`WirePaint::front_shape`] are not among them:
+    /// [`WirePaint::paint_in_front`] appends those.
+    pub fn paint(&self, geometry: &CableGeometry, clip_rect: Rect, shapes: &mut Vec<Shape>) {
+        if !self.reaches(geometry, clip_rect) {
+            return;
+        }
+
+        let strokes = self
+            .strokes
+            .iter()
+            .filter(|stroke| stroke.width > 0.0 && stroke.color != Color32::TRANSPARENT);
+
+        let beads = self
+            .beads
+            .iter()
+            .filter(|bead| bead.radius > 0.0 && bead.fill != Color32::TRANSPARENT);
+
+        shapes.extend(self.shapes_under.iter().cloned());
+        shapes.extend(strokes.map(|&stroke| geometry.stroke(stroke)));
+        shapes.extend(beads.map(|bead| {
+            Shape::circle_filled(geometry.anchor_at(bead.share).pos, bead.radius, bead.fill)
+        }));
+        shapes.extend(self.shapes_over.iter().cloned());
+    }
+
+    /// Appends the shapes added with [`WirePaint::front_shape`], unless the wire lies
+    /// outside `clip_rect`. They belong in front of the nodes.
+    pub fn paint_in_front(
+        &self,
+        geometry: &CableGeometry,
+        clip_rect: Rect,
+        shapes: &mut Vec<Shape>,
+    ) {
+        if !self.shapes_in_front.is_empty() && self.reaches(geometry, clip_rect) {
+            shapes.extend(self.shapes_in_front.iter().cloned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Color32, Rect, Shape, Stroke, pos2, vec2};
+
+    use crate::{InPinId, NodeId, OutPinId};
+
+    use super::{WirePaint, WirePins, WireRoute, WireStyle};
+
+    fn route(style: WireStyle) -> WireRoute {
+        WireRoute {
+            pins: Some(WirePins::new(
+                OutPinId {
+                    node: NodeId(0),
+                    output: 0,
+                },
+                InPinId {
+                    node: NodeId(1),
+                    input: 0,
+                },
+            )),
+            from: pos2(10.0, 20.0),
+            to: pos2(260.0, 140.0),
+            style,
+            frame_size: 30.0,
+            tolerance: 1.0,
+            scale: 1.0,
+            sag: vec2(0.0, 0.0),
+        }
+    }
+
+    const STYLES: [WireStyle; 4] = [
+        WireStyle::Line,
+        WireStyle::AxisAligned { corner_radius: 8.0 },
+        WireStyle::Bezier3,
+        WireStyle::Bezier5,
+    ];
+
+    #[test]
+    fn every_style_routes_between_the_measured_pin_centres() {
+        for style in STYLES {
+            let request = route(style);
+            let cable = request.default_route();
+
+            assert_eq!(cable.start(), request.from, "{style:?}");
+            assert_eq!(cable.end(), request.to, "{style:?}");
+            assert!(cable.length() >= request.from.distance(request.to) - 1e-3);
+
+            // Pins that sit behind each other still get a finite path.
+            let backwards = WireRoute {
+                from: request.to,
+                to: request.from,
+                ..request
+            };
+            let cable = backwards.default_route();
+            assert_eq!(cable.start(), backwards.from, "{style:?}");
+            assert_eq!(cable.end(), backwards.to, "{style:?}");
+            assert!(cable.length().is_finite());
+        }
+    }
+
+    #[test]
+    fn slack_moves_the_middle_and_keeps_the_ends() {
+        for style in STYLES {
+            let taut = route(style);
+            let slack = WireRoute {
+                sag: vec2(0.0, 30.0),
+                ..taut
+            };
+
+            let taut_cable = taut.default_route();
+            let slack_cable = slack.default_route();
+
+            assert_eq!(slack_cable.start(), taut.from, "{style:?}");
+            assert_eq!(slack_cable.end(), taut.to, "{style:?}");
+
+            let lowered = slack_cable.midpoint().pos.y - taut_cable.midpoint().pos.y;
+            assert!(lowered > 20.0 && lowered < 40.0, "{style:?}: {lowered}");
+        }
+    }
+
+    #[test]
+    fn painted_strokes_follow_the_hit_tested_path() {
+        let cable = route(WireStyle::Bezier5).default_route();
+        let paint = WirePaint::solid((3.0, Color32::WHITE))
+            .with_glow(Color32::from_rgb(255, 120, 40), 6.0)
+            .over((1.0, Color32::BLACK));
+
+        assert_eq!(paint.strokes().len(), 5);
+        assert_eq!(paint.hit_width().to_bits(), 3.0f32.to_bits());
+
+        // Back to front: widest halo first, highlight last.
+        let widths: Vec<f32> = paint.strokes().iter().map(|stroke| stroke.width).collect();
+        assert!(widths[0] > widths[1] && widths[1] > widths[2] && widths[2] > widths[3]);
+        assert_eq!(widths[0].to_bits(), 15.0f32.to_bits());
+        assert_eq!(paint.strokes()[4], Stroke::new(1.0, Color32::BLACK));
+
+        let mut shapes = Vec::new();
+        paint.paint(&cable, Rect::EVERYTHING, &mut shapes);
+        assert_eq!(shapes.len(), 5);
+
+        for shape in &shapes {
+            let Shape::Path(path) = shape else {
+                panic!("a wire is painted as open paths, got {shape:?}");
+            };
+            assert!(!path.closed);
+            assert_eq!(path.points, cable.points());
+        }
+
+        // Every painted vertex is on the path the pointer is tested against.
+        for &point in cable.points() {
+            assert!(cable.hit(point, 0.0).is_some());
+        }
+    }
+
+    #[test]
+    fn shapes_of_the_viewer_are_painted_around_the_strokes_and_count_for_culling() {
+        let cable = route(WireStyle::Line).default_route();
+        let mark = |x: f32, color| Shape::circle_filled(pos2(x, 500.0), 4.0, color);
+
+        let paint = WirePaint::solid((3.0, Color32::WHITE))
+            .with_bead(0.5, 4.0, Color32::GREEN)
+            .under_shape(mark(1.0, Color32::RED))
+            .over_shape(mark(2.0, Color32::RED))
+            .under_shape(mark(3.0, Color32::RED))
+            .over_shape(mark(4.0, Color32::RED));
+
+        assert_eq!(paint.shapes_under().len(), 2);
+        assert_eq!(paint.shapes_over().len(), 2);
+        assert_eq!(paint.hit_width().to_bits(), 3.0f32.to_bits());
+
+        let mut shapes = Vec::new();
+        paint.paint(&cable, Rect::EVERYTHING, &mut shapes);
+
+        let order: Vec<f32> = shapes
+            .iter()
+            .map(|shape| match shape {
+                Shape::Circle(circle) if circle.fill == Color32::RED => circle.center.x,
+                Shape::Circle(_) => -1.0,
+                _ => 0.0,
+            })
+            .collect();
+        // The shape put under last, the one before it, the stroke, the bead, then the
+        // shapes put over in the order they were given.
+        assert_eq!(order, [3.0, 1.0, 0.0, -1.0, 2.0, 4.0]);
+
+        // A view that shows only where the shapes are still gets the wire painted.
+        let around_marks = Rect::from_center_size(pos2(2.0, 500.0), vec2(4.0, 4.0));
+        assert!(!cable.bounds().expand(10.0).intersects(around_marks));
+        shapes.clear();
+        paint.paint(&cable, around_marks, &mut shapes);
+        assert_eq!(shapes.len(), 6);
+
+        // A view that shows neither gets nothing.
+        shapes.clear();
+        paint.paint(
+            &cable,
+            Rect::from_center_size(pos2(-900.0, -900.0), vec2(10.0, 10.0)),
+            &mut shapes,
+        );
+        assert!(shapes.is_empty());
+
+        // Nothing is painted for a wire that was given no shape.
+        assert!(WirePaint::hidden().shapes_under().is_empty());
+        assert!(WirePaint::hidden().shapes_over().is_empty());
+        assert!(WirePaint::hidden().shapes_in_front().is_empty());
+    }
+
+    #[test]
+    fn shapes_for_the_front_of_the_nodes_are_kept_apart_and_count_for_culling() {
+        let cable = route(WireStyle::Line).default_route();
+        let mark = |x: f32| Shape::circle_filled(pos2(x, 500.0), 4.0, Color32::RED);
+
+        let plain = WirePaint::solid((3.0, Color32::WHITE)).over_shape(mark(1.0));
+        let paint = plain.clone().front_shape(mark(2.0)).front_shape(mark(3.0));
+        assert_eq!(paint.shapes_in_front().len(), 2);
+
+        // The wire's own layer gets what it got without them.
+        let (mut own, mut expected) = (Vec::new(), Vec::new());
+        paint.paint(&cable, Rect::EVERYTHING, &mut own);
+        plain.paint(&cable, Rect::EVERYTHING, &mut expected);
+        assert_eq!(own, expected);
+
+        // They are handed over separately, in the order they were given.
+        let mut front = Vec::new();
+        paint.paint_in_front(&cable, Rect::EVERYTHING, &mut front);
+        let order: Vec<f32> = front
+            .iter()
+            .map(|shape| match shape {
+                Shape::Circle(circle) => circle.center.x,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(order, [2.0, 3.0]);
+
+        // A view that shows only one of them still gets the whole wire.
+        let around = Rect::from_center_size(pos2(3.0, 500.0), vec2(1.0, 1.0));
+        assert!(!cable.bounds().expand(10.0).intersects(around));
+        let (mut own, mut front) = (Vec::new(), Vec::new());
+        paint.paint(&cable, around, &mut own);
+        paint.paint_in_front(&cable, around, &mut front);
+        assert_eq!((own.len(), front.len()), (2, 2));
+
+        // A view that shows nothing of the wire gets none.
+        let away = Rect::from_center_size(pos2(-900.0, -900.0), vec2(10.0, 10.0));
+        let (mut own, mut front) = (Vec::new(), Vec::new());
+        paint.paint(&cable, away, &mut own);
+        paint.paint_in_front(&cable, away, &mut front);
+        assert!(own.is_empty() && front.is_empty());
+
+        // A wire with nothing for the front adds nothing.
+        plain.paint_in_front(&cable, Rect::EVERYTHING, &mut front);
+        assert!(front.is_empty());
+    }
+
+    #[test]
+    fn beads_are_placed_on_the_painted_path() {
+        let cable = route(WireStyle::Bezier5).default_route();
+        let paint = WirePaint::solid((3.0, Color32::WHITE))
+            .with_bead(0.0, 4.0, Color32::RED)
+            .with_bead(0.4, 5.0, Color32::GREEN)
+            .with_bead(2.0, 6.0, Color32::BLUE)
+            .with_bead(0.5, 0.0, Color32::RED)
+            .with_bead(0.5, 3.0, Color32::TRANSPARENT);
+
+        assert_eq!(paint.beads().len(), 5);
+        assert_eq!(paint.hit_width().to_bits(), 3.0f32.to_bits());
+
+        let mut shapes = Vec::new();
+        paint.paint(&cable, Rect::EVERYTHING, &mut shapes);
+
+        // The stroke first, then the three discs that have a size and a colour.
+        let [Shape::Path(_), discs @ ..] = shapes.as_slice() else {
+            panic!("the stroke is painted first, got {shapes:?}");
+        };
+        assert_eq!(discs.len(), 3);
+
+        for (disc, (share, radius, fill)) in discs.iter().zip([
+            (0.0, 4.0f32, Color32::RED),
+            (0.4, 5.0, Color32::GREEN),
+            (1.0, 6.0, Color32::BLUE),
+        ]) {
+            let Shape::Circle(disc) = disc else {
+                panic!("a bead is a disc, got {disc:?}");
+            };
+            assert_eq!(disc.center, cable.anchor_at(share).pos);
+            assert!(cable.hit(disc.center, 1e-3).is_some());
+            assert_eq!(disc.radius.to_bits(), radius.to_bits());
+            assert_eq!(disc.fill, fill);
+        }
+
+        // A wire may be nothing but beads.
+        let mut shapes = Vec::new();
+        WirePaint::hidden().with_bead(0.5, 4.0, Color32::RED).paint(
+            &cable,
+            Rect::EVERYTHING,
+            &mut shapes,
+        );
+        assert!(matches!(shapes.as_slice(), [Shape::Circle(_)]));
+
+        // A bead that reaches into the clip rectangle is painted even when the path stops
+        // short of it.
+        let past_the_end = Rect::from_min_size(cable.end() + vec2(3.0, -40.0), vec2(50.0, 80.0));
+        let mut shapes = Vec::new();
+        WirePaint::solid((3.0, Color32::WHITE)).paint(&cable, past_the_end, &mut shapes);
+        assert!(shapes.is_empty());
+        paint.paint(&cable, past_the_end, &mut shapes);
+        assert_eq!(shapes.len(), 4);
+    }
+
+    #[test]
+    fn hidden_and_offscreen_wires_paint_nothing() {
+        let cable = route(WireStyle::Bezier3).default_route();
+        let mut shapes = Vec::new();
+
+        WirePaint::hidden().paint(&cable, Rect::EVERYTHING, &mut shapes);
+        assert!(shapes.is_empty());
+
+        let far_away = Rect::from_min_size(pos2(5000.0, 5000.0), vec2(100.0, 100.0));
+        WirePaint::solid((2.0, Color32::WHITE)).paint(&cable, far_away, &mut shapes);
+        assert!(shapes.is_empty());
+
+        WirePaint::solid((2.0, Color32::TRANSPARENT)).paint(&cable, Rect::EVERYTHING, &mut shapes);
+        assert!(shapes.is_empty());
+
+        // A stroke thinner than one graph unit keeps the width it was given: it may be several
+        // points wide on screen in a magnified view. egui fades what is thinner than a pixel.
+        WirePaint::solid((0.5, Color32::WHITE)).paint(&cable, Rect::EVERYTHING, &mut shapes);
+        let [Shape::Path(path)] = shapes.as_slice() else {
+            panic!("expected one path");
+        };
+        assert_eq!(path.stroke.width.to_bits(), 0.5f32.to_bits());
+        assert_eq!(
+            path.stroke.color,
+            egui::epaint::ColorMode::Solid(Color32::WHITE)
+        );
+    }
 }
